@@ -1,5 +1,7 @@
 # UR10 Vision Control
 
+[English](README.md) ｜ [廣東話](README_yue.md)
+
 A Python / Qt desktop prototype that uses MediaPipe hand landmarks to produce conservative Cartesian velocity commands for Universal Robots URSim or a UR10 through RTDE.
 
 > **Prototype only — not a certified safety system.** Start with the camera-only demo or URSim. Do not use this project for autonomous operation around people. A real robot requires a site-specific risk assessment, controller safety configuration, verified workspace limits, an accessible physical emergency stop, and qualified supervision.
