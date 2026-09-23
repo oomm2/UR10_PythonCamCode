@@ -1,0 +1,15 @@
+{
+  "target": "URSim",
+  "robot_ip_ursim": "127.0.0.1",
+  "robot_ip_real": "",
+  "direction_inverted": false,
+  "depth_inverted": false,
+  "camera_source": "0",
+  "camera_manual": "0",
+  "max_speed": 0.02,
+  "detection": 0.8,
+  "tracking": 0.6,
+  "smoothing": 0.25,
+  "dead_zone": 0.1,
+  "size_sensitivity": 3.0
+}
