@@ -1,0 +1,38 @@
+# Local credentials and deployment configuration
+.env
+.env.*
+!.env.example
+config.json
+config.local.json
+*.pem
+*.key
+credentials*
+secrets*
+
+# Environments, dependencies, caches and test output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+node_modules/
+
+# Runtime data and internal audit outputs
+recordings/
+artifacts/
+*.log
+*_scan.json
+*_scan_report.md
+PUBLICATION_REVIEW.md
+
+# Local workspace and upstream repository metadata
+.git.upstream-backup/
+.workbuddy-ai/
+.zcode/
+.DS_Store
+Thumbs.db
+desktop.ini

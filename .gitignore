@@ -23,3 +23,19 @@ settings.json
 .ruff_cache/
 .idea/
 .vscode/
+
+# Read-only monitor local configuration and runtime artifacts
+monitor/.env
+monitor/.env.*
+!monitor/.env.example
+monitor/config.json
+monitor/config.local.json
+monitor/recordings/
+monitor/artifacts/
+monitor/*.log
+monitor/*_scan.json
+monitor/*_scan_report.md
+monitor/PUBLICATION_REVIEW.md
+monitor/.venv/
+monitor/venv/
+monitor/node_modules/

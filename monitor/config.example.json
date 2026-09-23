@@ -1,0 +1,19 @@
+{
+  "robot_ip": "192.0.2.10",
+  "rtde_port": 30004,
+  "rtde_frequency": 25.0,
+  "http_host": "127.0.0.1",
+  "http_port": 8080,
+  "monitor_advertised_ip": "192.0.2.20",
+  "controller_heartbeat_timeout": 4.0,
+  "cors_allowed_origins": [],
+  "heartbeat_max_failures": 5,
+  "heartbeat_lockout_seconds": 60.0,
+  "event_stream_frequency": 10.0,
+  "recording_directory": "recordings",
+  "recording_max_seconds": 3600.0,
+  "robot_model": "UR10",
+  "latency_mode": "monotonic",
+  "trajectory_capacity": 20000,
+  "trajectory_sample_hz": 25.0
+}

@@ -1,4 +1,4 @@
-name: Safety tests
+name: Validate public FYP suite
 
 on:
   push:
@@ -8,14 +8,60 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  controller:
+    name: Vision controller safety tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
+      - name: Install headless Qt libraries
+        run: sudo apt-get update && sudo apt-get install --yes libegl1
+      - name: Install controller dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
       - name: Run safety-policy tests
         run: python -m unittest discover -s tests -v
+
+  monitor:
+    name: Read-only monitor tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: monitor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install monitor tooling
+        run: python -m pip install --upgrade pip && python -m pip install ruff mypy
+      - name: Install RTDE client
+        continue-on-error: true
+        run: python -m pip install -r requirements.txt
+      - name: Initialize local test configuration
+        run: cp config.example.json config.json
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Build bundled robot model
+        run: python tools/build_models.py
+      - name: Run static checks
+        run: python -m ruff check . && python -m mypy
+      - name: Run local HTTP smoke test
+        run: python tools/smoke_test.py
+      - name: Run browser-module tests
+        run: node --test "tests/js/*.test.mjs"
+
+  public-tree:
+    name: Public-data safeguards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check tracked files for private deployment data
+        run: python tools/check_public_tree.py

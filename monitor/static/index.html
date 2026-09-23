@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UR Read-only Monitor</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three/build/three.module.js",
+        "three/addons/": "/vendor/three/examples/jsm/",
+        "three/examples/jsm/": "/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+  <style>
+    /* Dark is the default; [data-theme="light"] re-declares every token so the
+       whole dashboard — including the 3D canvas backdrop — can flip for a
+       projector without a reload. */
+    :root {
+      color-scheme: dark;
+      --bg:#111827; --panel:#1f2937; --panel-sunken:#111827; --header:#0f172a;
+      --border:#374151; --muted:#9ca3af; --text:#f3f4f6; --text-soft:#cbd5e1;
+      --hint:#64748b; --chart-guide:#374151; --chart-axis:#6b7280;
+      --good:#22c55e; --warn:#f59e0b; --warn-strong:#fb923c; --bad:#ef4444;
+      --blue:#60a5fa; --accent:#22d3ee; --control-border:#365780;
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --bg:#f1f5f9; --panel:#ffffff; --panel-sunken:#f8fafc; --header:#e2e8f0;
+      --border:#cbd5e1; --muted:#64748b; --text:#0f172a; --text-soft:#334155;
+      --hint:#94a3b8; --chart-guide:#cbd5e1; --chart-axis:#94a3b8;
+      --good:#15803d; --warn:#b45309; --warn-strong:#c2410c; --bad:#b91c1c;
+      --blue:#2563eb; --accent:#0e7490; --control-border:#93c5fd;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Segoe UI, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    header { height: 64px; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: var(--header); }
+    h1 { font-size: 20px; margin: 0; }
+    .subtitle { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .pill { border: 1px solid var(--border); border-radius: 999px; padding: 7px 12px; font-size: 13px; white-space: nowrap; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); margin-right: 7px; }
+    .ok .dot { background: var(--good); }
+    .waiting .dot { background: var(--warn); }
+    .error .dot { background: var(--bad); }
+    button { font: inherit; color: inherit; background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+    button:hover { border-color: var(--blue); }
+    button.active { border-color: var(--accent); color: var(--accent); }
+    main { display: grid; grid-template-columns: minmax(480px, 1.4fr) minmax(350px, .8fr); gap: 16px; padding: 16px; height: calc(100vh - 64px); }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .card-title { padding: 13px 16px; border-bottom: 1px solid var(--border); font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .card-actions { display: flex; gap: 6px; align-items: center; }
+    .card-actions button { padding: 4px 9px; font-size: 12px; }
+    #scene { position: relative; width: 100%; height: calc(100% - 48px); min-height: 480px; }
+    #scene canvas { display: block; width: 100% !important; height: 100% !important; }
+    #scene-status { position: absolute; left: 16px; top: 14px; z-index: 2; color: var(--hint); font-size: 12px; pointer-events: none; }
+    .scene-hint { position: absolute; right: 16px; bottom: 12px; z-index: 2; color: var(--hint); font-size: 11px; pointer-events: none; text-align: right; }
+    .right { display: flex; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; padding-right: 2px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 16px; }
+    .grid.wide { grid-template-columns: 1fr; }
+    .metric { background: var(--panel-sunken); border-radius: 8px; padding: 11px; min-width: 0; }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { font-variant-numeric: tabular-nums; font-size: 15px; margin-top: 4px; overflow-wrap: anywhere; }
+    .small-value { font-size: 12px; letter-spacing: .01em; }
+    .control-card { border-color: var(--control-border); }
+    .control-state { font-size: 11px; padding: 4px 8px; }
+    .control-state .dot { width: 7px; height: 7px; margin-right: 5px; }
+    .controller-note, .joint-note, .chart-note { border-top: 1px solid var(--border); padding: 9px 16px 11px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .joint-list { padding: 8px 16px 16px; }
+    .joint { display: grid; grid-template-columns: 70px 1fr 75px; align-items: center; gap: 8px; margin: 9px 0; font-size: 13px; }
+    .joint.dimmed { opacity: .28; }
+    .joint.highlighted .joint-label { color: var(--accent); font-weight: 600; }
+    .joint-value { text-align: right; font-variant-numeric: tabular-nums; }
+    .bar { height: 7px; background: var(--border); border-radius: 5px; overflow: hidden; }
+    .bar i { display: block; height: 100%; background: var(--blue); width: 0; transition: width .15s ease, background-color .15s ease; }
+    .bar i.out-of-range { background: var(--warn); }
+    .bar i.jump { background: var(--bad); }
+    .charts { display: grid; grid-template-columns: 1fr; gap: 1px; background: var(--border); }
+    .chart-box { background: var(--panel); }
+    .chart-label { padding: 8px 16px 0; color: var(--muted); font-size: 11px; }
+    .chart-box svg { display: block; width: 100%; height: 92px; }
+    .log { overflow: auto; padding: 12px 16px; color: var(--text-soft); font: 12px Consolas, monospace; min-height: 110px; }
+    .muted { color: var(--muted); }
+    .warn { color: var(--warn); }
+    .warn-strong { color: var(--warn-strong); font-weight: 600; }
+    .bad { color: var(--bad); font-weight: 600; }
+    .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 0 16px 10px; font-size: 10px; color: var(--muted); }
+    .legend span::before { content: ''; display: inline-block; width: 8px; height: 2px; margin-right: 4px; vertical-align: middle; background: currentColor; }
+    .replay-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--border); }
+    .replay-bar input[type="range"] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+    .replay-bar select { font: inherit; color: inherit; background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+    .alert { margin: 0 16px 12px; padding: 8px 11px; border-radius: 8px; border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); font-size: 12px; }
+    .alert[hidden] { display: none; }
+    .baseline-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); }
+    .baseline-grid .chart-cell { background: var(--panel); }
+    .baseline-grid svg { display: block; width: 100%; height: 80px; }
+    .shortcut-list { padding: 10px 16px 14px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+    .shortcut-list kbd { background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-family: Consolas, monospace; font-size: 11px; color: var(--text); }
+    [hidden] { display: none !important; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; height: auto; }
+      .right { overflow: visible; display: grid; grid-template-columns: 1fr 1fr; }
+      #scene { min-height: 400px; }
+      .right .card:last-child { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1 id="app-title">UR10 Monitor</h1><div class="subtitle">Read-only RTDE telemetry · Windows</div></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <div id="transport" class="pill waiting"><span>Starting…</span></div>
+      <div id="frozen" class="pill waiting" hidden><span>Frozen</span></div>
+      <div id="connection" class="pill waiting"><span class="dot"></span><span>Disconnected</span></div>
+      <button id="theme-toggle" type="button" title="Toggle light/dark theme (T)">Theme</button>
+      <button id="help-toggle" type="button" title="Keyboard shortcuts (?)">?</button>
+    </div>
+  </header>
+  <main>
+    <section class="card">
+      <div class="card-title">
+        <span>Digital Twin</span>
+        <span class="card-actions">
+          <button id="trail-toggle" type="button" class="active" title="Show the recorded TCP trail (L)">Trail</button>
+          <button id="rings-toggle" type="button" title="Show joint limit rings (J)">Limits</button>
+          <button id="snapshot-button" type="button" title="Export a PNG snapshot or HTML report (S)">Export</button>
+        </span>
+      </div>
+      <div id="scene">
+        <div id="scene-status">Loading robot URDF…</div>
+        <div class="scene-hint">Drag to orbit · Scroll to zoom<br />R reset · G grid · Space freeze · S export · 1-6 joint</div>
+      </div>
+      <div class="replay-bar">
+        <button id="replay-play" type="button" title="Play/pause the recorded trail (Space)">Play</button>
+        <button id="replay-reset" type="button">Rewind</button>
+        <input id="replay-scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Trajectory position" />
+        <select id="replay-speed" aria-label="Replay speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+        <span id="replay-readout" class="muted" style="font-size:12px;min-width:120px">0 / 0 points</span>
+        <button id="trajectory-refresh" type="button" title="Reload the trail from the server">Reload</button>
+      </div>
+      <div id="jump-alert" class="alert" hidden></div>
+    </section>
+    <section class="right">
+      <section class="card">
+        <div class="card-title">Robot Status</div>
+        <div class="grid">
+          <div class="metric"><div class="label">Robot IP</div><div id="ip" class="value">—</div></div>
+          <div class="metric"><div class="label">Windows monitor IP</div><div id="monitor-ip" class="value">—</div></div>
+          <div class="metric"><div class="label">Last update</div><div id="age" class="value">—</div></div>
+          <div class="metric"><div class="label">Robot mode</div><div id="robot-mode" class="value">—</div></div>
+          <div class="metric"><div class="label">Safety mode</div><div id="safety-mode" class="value">—</div></div>
+          <div class="metric"><div class="label">Speed scaling</div><div id="speed" class="value">—</div></div>
+          <div class="metric"><div class="label">Monitor role</div><div class="value small-value">RTDE output-only</div></div>
+          <div class="metric"><div class="label">Data transport</div><div id="transport-metric" class="value small-value">—</div></div>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-title">Link Diagnostics</div>
+        <div class="grid">
+          <div class="metric"><div class="label">Reconnects</div><div id="diag-reconnects" class="value">—</div></div>
+          <div class="metric"><div class="label">Cumulative uptime</div><div id="diag-uptime" class="value">—</div></div>
+          <div class="metric"><div class="label">Samples read</div><div id="diag-samples" class="value">—</div></div>
+          <div class="metric"><div class="label">Trail points</div><div id="diag-points" class="value">—</div></div>
+          <div class="metric"><div class="label">SSE subscribers</div><div id="diag-subscribers" class="value">—</div></div>
+          <div class="metric"><div class="label">Last sample age</div><div id="diag-sample-age" class="value">—</div></div>
+        </div>
+        <div id="diag-reason" class="controller-note">No disconnect recorded in this session.</div>
+      </section>
+      <section class="card">
+        <div class="card-title">Latency</div>
+        <div class="grid">
+          <div class="metric"><div class="label">Mode</div><div id="latency-mode" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Last heartbeat</div><div id="latency-last" class="value">—</div></div>
+          <div class="metric"><div class="label">Mean</div><div id="latency-mean" class="value">—</div></div>
+          <div class="metric"><div class="label">p95</div><div id="latency-p95" class="value">—</div></div>
+          <div class="metric"><div class="label">Min / Max</div><div id="latency-range" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Samples</div><div id="latency-samples" class="value">—</div></div>
+        </div>
+        <div id="latency-note" class="controller-note">Monotonic mode measures arrival delay without needing clock synchronisation with the Mac.</div>
+      </section>
+      <section class="card control-card">
+        <div class="card-title">Control Client <span id="control-status" class="pill control-state waiting"><span class="dot"></span><span>Waiting</span></span></div>
+        <div class="grid">
+          <div class="metric"><div class="label">Observed source IP</div><div id="control-ip" class="value">Unknown</div></div>
+          <div class="metric"><div class="label">Controller name</div><div id="control-name" class="value">—</div></div>
+          <div class="metric"><div class="label">Reported state</div><div id="control-state" class="value">Unknown</div></div>
+          <div class="metric"><div class="label">Control protocol</div><div id="control-protocol" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Heartbeat age</div><div id="control-age" class="value">—</div></div>
+          <div class="metric"><div class="label">Target robot</div><div id="control-robot" class="value">—</div></div>
+          <div class="metric"><div class="label">Vision FPS</div><div id="vision-fps" class="value">—</div></div>
+          <div class="metric"><div class="label">Tracking confidence</div><div id="vision-confidence" class="value">—</div></div>
+          <div class="metric"><div class="label">Current gesture</div><div id="vision-gesture" class="value">—</div></div>
+          <div class="metric"><div class="label">Dropped frames</div><div id="vision-dropped" class="value">—</div></div>
+          <div class="metric"><div class="label">Inference time</div><div id="vision-inference" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Heartbeats received</div><div id="control-count" class="value">—</div></div>
+        </div>
+        <div class="controller-note">控制端每秒向 monitor 發 heartbeat 時，IP 會由 Windows 自動從 HTTP source address 記錄。RTDE 本身唔會提供其他 client 的 IP 清單。</div>
+      </section>
+      <section class="card">
+        <div class="card-title">TCP Pose</div>
+        <div class="grid wide">
+          <div class="metric"><div class="label">Position (x, y, z) m</div><div id="tcp-position" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Orientation (rx, ry, rz)</div><div id="tcp-orientation" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Tool speed (linear / angular)</div><div id="tcp-speed" class="value small-value">—</div></div>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-title">Joint Angles</div>
+        <div id="joints" class="joint-list"></div>
+        <div id="joint-range-note" class="joint-note">Bars show nominal ROS planning ranges.</div>
+        <div class="grid wide">
+          <div class="metric"><div class="label">Joint current (A)</div><div id="joint-current" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Joint temperature (°C)</div><div id="joint-temp" class="value small-value">—</div></div>
+          <div class="metric"><div class="label">Digital I/O</div><div id="digital-io" class="value small-value">—</div></div>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-title">Trends</div>
+        <div class="legend">
+          <span style="color:#60a5fa">J1</span><span style="color:#f472b6">J2</span><span style="color:#facc15">J3</span>
+          <span style="color:#4ade80">J4</span><span style="color:#22d3ee">J5</span><span style="color:#a78bfa">J6</span>
+        </div>
+        <div class="charts">
+          <div class="chart-box">
+            <div class="chart-label">Joint angles (degrees) · last 600 samples</div>
+            <svg id="chart-joints" viewBox="0 0 320 92" preserveAspectRatio="none"></svg>
+          </div>
+          <div class="chart-box">
+            <div class="chart-label">Tool speed (m/s) and joint current (A)</div>
+            <svg id="chart-load" viewBox="0 0 320 92" preserveAspectRatio="none"></svg>
+          </div>
+        </div>
+        <div class="chart-note">Trends are kept in the browser only and are cleared on reload. Charts do not alter the RTDE session.</div>
+      </section>
+      <section class="card">
+        <div class="card-title">
+          <span>Baseline Comparison</span>
+          <span class="card-actions">
+            <select id="baseline-left" aria-label="Left recording"></select>
+            <select id="baseline-right" aria-label="Right recording"></select>
+            <button id="baseline-load" type="button">Compare</button>
+          </span>
+        </div>
+        <div class="baseline-grid">
+          <div class="chart-cell">
+            <div class="chart-label">Left · joint angles (deg)</div>
+            <svg id="baseline-left-chart" viewBox="0 0 320 80" preserveAspectRatio="none"></svg>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-label">Right · joint angles (deg)</div>
+            <svg id="baseline-right-chart" viewBox="0 0 320 80" preserveAspectRatio="none"></svg>
+          </div>
+        </div>
+        <div id="baseline-note" class="chart-note">Pick two recordings to compare Mac control against a manual jog run.</div>
+      </section>
+      <section class="card" id="shortcut-card" hidden>
+        <div class="card-title">Keyboard Shortcuts</div>
+        <div class="shortcut-list">
+          <div><kbd>Space</kbd> freeze / resume the live view</div>
+          <div><kbd>S</kbd> export a PNG snapshot + HTML report</div>
+          <div><kbd>1</kbd>–<kbd>6</kbd> highlight a single joint (press again to clear)</div>
+          <div><kbd>L</kbd> toggle the recorded trail</div>
+          <div><kbd>J</kbd> toggle joint limit rings</div>
+          <div><kbd>P</kbd> play / pause trajectory replay</div>
+          <div><kbd>C</kbd> clear the on-screen trail</div>
+          <div><kbd>T</kbd> switch light / dark theme</div>
+          <div><kbd>R</kbd> reset the 3D view · <kbd>G</kbd> toggle grid</div>
+          <div><kbd>?</kbd> show or hide this panel</div>
+        </div>
+      </section>
+      <section class="card" style="min-height:0;flex:1">
+        <div class="card-title">Events</div>
+        <div id="log" class="log"><div class="muted">Waiting for RTDE telemetry…</div></div>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

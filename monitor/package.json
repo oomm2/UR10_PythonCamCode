@@ -1,0 +1,14 @@
+{
+  "name": "ur-monitor-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-side modules for the UR10 read-only monitor. Server-side Python lives in server.py.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/js/*.test.mjs\"",
+    "test:watch": "node --test --watch \"tests/js/*.test.mjs\""
+  }
+}

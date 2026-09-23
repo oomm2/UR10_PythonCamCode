@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<rtde_config>
+  <!-- Output-only recipe. No input recipe is intentionally defined. -->
+  <recipe key="monitor">
+    <field name="timestamp" type="DOUBLE" />
+    <field name="actual_q" type="VECTOR6D" />
+    <field name="actual_TCP_pose" type="VECTOR6D" />
+    <field name="actual_TCP_speed" type="VECTOR6D" />
+    <field name="actual_joint_current" type="VECTOR6D" />
+    <field name="joint_temperatures" type="VECTOR6D" />
+    <field name="robot_mode" type="INT32" />
+    <field name="safety_mode" type="INT32" />
+    <field name="speed_scaling" type="DOUBLE" />
+    <field name="actual_digital_input_bits" type="UINT64" />
+    <field name="actual_digital_output_bits" type="UINT64" />
+  </recipe>
+</rtde_config>

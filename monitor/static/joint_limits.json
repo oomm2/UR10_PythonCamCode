@@ -1,0 +1,12 @@
+{
+  "source": "vendor/Universal_Robots_ROS2_Description/config/ur10/joint_limits.yaml",
+  "purpose": "Nominal dashboard bar scales; live joint values and the 3D model are never clamped.",
+  "joints": [
+    {"id":"shoulder_pan_joint","label":"J1","lower":-6.283185307179586,"upper":6.283185307179586},
+    {"id":"shoulder_lift_joint","label":"J2","lower":-6.283185307179586,"upper":6.283185307179586},
+    {"id":"elbow_joint","label":"J3","lower":-3.141592653589793,"upper":3.141592653589793,"note":"Nominal ROS planning range; not a controller safety limit."},
+    {"id":"wrist_1_joint","label":"J4","lower":-6.283185307179586,"upper":6.283185307179586},
+    {"id":"wrist_2_joint","label":"J5","lower":-6.283185307179586,"upper":6.283185307179586},
+    {"id":"wrist_3_joint","label":"J6","lower":-6.283185307179586,"upper":6.283185307179586}
+  ]
+}
