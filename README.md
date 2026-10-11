@@ -34,6 +34,8 @@ The controller is responsible for commands; the monitor only observes RTDE outpu
 
 The supported controller application is `ur10_vision_qt_app.py`. `ur10_vision_app.py` is a compatibility launcher, not the primary implementation.
 
+See the [detailed controller operation guide](docs/controller-operation.md) for calibration, mode changes, STOP behaviour, worker interlocks, physical workspace setup, and offline validation.
+
 ### Features
 
 - PySide6 dashboard with camera preview, calibration progress, and switchable light/dark themes
@@ -99,7 +101,9 @@ py -m venv .venv
 .\.venv\Scripts\python.exe server.py
 ```
 
-Open `http://127.0.0.1:8080`. Keep the HTTP server on loopback unless a trusted local network deployment has been explicitly reviewed. Put the actual controller address and any heartbeat token only in ignored `monitor/config.json` and `monitor/.env`.
+Open `http://127.0.0.1:8080`. Keep the HTTP server on loopback unless a trusted local network deployment has been explicitly reviewed. Put the actual controller address in ignored `monitor/config.json` and any heartbeat token in ignored `monitor/.env` or a private process environment variable.
+
+The `192.0.2.x` addresses in the example configuration are documentation placeholders. Edit `robot_ip` to the real URSim/controller address before connecting. The Qt app does not start the monitor or send controller heartbeats automatically; the optional heartbeat setup is described in the monitor guide.
 
 See [monitor/README.md](monitor/README.md) for its API, recording, heartbeat, and dashboard details. Recordings, screenshots, exported reports, and telemetry may contain deployment or personal data; review them before sharing.
 
@@ -116,7 +120,7 @@ See [monitor/README.md](monitor/README.md) for its API, recording, heartbeat, an
 ### Vision controller
 
 ```bash
-python -m unittest discover -s tests -v
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
 ```
 
 ### Read-only monitor
@@ -126,6 +130,7 @@ cd monitor
 Copy-Item config.example.json config.json
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --test "tests/js/*.test.mjs"
+py tools/smoke_test.py
 ```
 
 The monitor tests and smoke test use local loopback only; they do not open a robot connection. CI runs controller and monitor checks independently.

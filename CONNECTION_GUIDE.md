@@ -17,7 +17,11 @@ docker run --rm -it \
 
 Open `http://localhost:6080/vnc.html` to use PolyScope. In the app, select **URSim**, use `127.0.0.1`, then click **連接機械人**. Motion remains disabled until you explicitly enable it.
 
+The selected target and address are locked for a connection session. Choosing URSim in the app does not prove that the entered address belongs to a simulator; verify the endpoint yourself.
+
 Prepare power, brakes, and the controller operating mode manually in PolyScope before requesting motion. The app does not power on or release the brakes through the Dashboard server.
+
+After connecting, wait for the RTDE control interface and communication watchdog to report ready before enabling control. If setup times out, stop and disconnect, correct the controller state, then reconnect.
 
 ## URSim in a virtual machine or another host
 
@@ -44,6 +48,8 @@ For NAT networking, forward host TCP port `30004` to guest TCP port `30004`, the
 5. Keep motion disabled while checking camera commands. For e-Series, configure Remote Control / Remote mode through PolyScope before any controlled test.
 6. Before physical control, measure and review the TCP base-frame X/Y/Z limits for the actual cell, then set the six `REAL_WORKSPACE_*` values locally. The public defaults are `None`, which intentionally lock physical control.
 
+With control disabled, confirm the reviewed physical speed explicitly. Startup resets to 0.02 m/s; 0.50 m/s is only a configurable software ceiling, not a validated safe speed. Physical targets cannot run the automatic axis tests or return motions.
+
 ## Remote-control status check
 
 After configuring Remote mode in PolyScope, inspect the status through the Dashboard server:
@@ -61,3 +67,14 @@ A `true` reply only indicates remote mode. It does not replace the hardware chec
 - Verify all workspace boundaries in URSim before considering hardware.
 - Keep an emergency stop accessible and keep people outside the workspace.
 - Treat the software guard as supervisory only; use the controller’s configured safety functions and local risk assessment.
+
+## Troubleshooting
+
+| Message | What to check |
+| --- | --- |
+| 下限必須小於上限 | Correct the measured profile in `safety_config.py`; values are never silently swapped. |
+| 控制介面未就緒 / 建立逾時 | PolyScope power, operating mode and connection; reconnect after correction. |
+| TCP 姿態回饋中斷 | Controller timestamp progression, network and worker state. |
+| 影像回饋中斷或過期 | Camera/RTSP input, inference time and stream buffering; re-open and recalibrate if needed. |
+| STOP 未確認 | Inspect the controller directly. A UI request is not proof of a physical stop. |
+| CSV 寫入失敗 | Disk permissions / capacity; logging failure is reported separately. |

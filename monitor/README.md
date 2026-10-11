@@ -1,12 +1,12 @@
-# UR10——MonitorUsingPython
+# UR10 read-only monitor
 
 Read-only UR10 RTDE telemetry monitor for Windows.
 
-Intended GitHub repository slug: `UR10--MonitorUsingPython`.
+This module lives in the `monitor/` directory of the UR10 Vision Control repository.
 All `192.0.2.x` addresses below are documentation examples, not live deployment addresses.
 The Mac Vision program remains the only controller: this app uses an RTDE **output-only** recipe and never sends URScript, motion commands, or RTDE input registers.
 
-The design stays read-only on purpose — there is no input recipe, no URScript and no motion command anywhere in this repository.
+The design stays read-only on purpose — there is no input recipe, no URScript and no motion command in this monitor module.
 
 ## Architecture
 
@@ -21,7 +21,7 @@ The monitor can run at the same time as the Mac control client because it only s
 ## Install (Windows PowerShell)
 
 ```powershell
-cd path\to\UR10--MonitorUsingPython
+cd path\to\UR10_PythonCamCode\monitor
 Copy-Item config.example.json config.json
 # Edit config.json for your robot and monitor before starting the server.
 py -m venv .venv
@@ -318,5 +318,3 @@ This is a monitoring aid, not a safety device. It cannot stop or prevent robot m
 Read endpoints, including telemetry and recording downloads, are not authenticated. CORS is not
 an access-control boundary for non-browser clients. Use only on a trusted network and do not
 publish live recordings, screenshots or reports without reviewing them for deployment metadata.
-
-See [PUBLIC_RELEASE_CHECK.md](PUBLIC_RELEASE_CHECK.md) for preparation checks and remaining blockers.
