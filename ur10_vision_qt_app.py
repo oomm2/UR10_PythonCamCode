@@ -6,56 +6,33 @@ forward/backward after a neutral-size calibration in the centre of the frame.
 
 from __future__ import annotations
 
-import csv
-import json
+from vision_control.clock import monotonic
+
 import math
 import multiprocessing as mp_process
 import os
+import re
 import socket
 import sys
 import time
 from typing import Optional
 
-from safety_config import (
-    DEFAULT_SPEED,
-    MAX_TRANSLATIONAL_SPEED,
-    REAL_TARGET,
-    RETURN_SPEED,
-    URSIM_TARGET,
-    cap_translational_velocity,
-    speed_for_profile,
-    workspace_profile,
-    workspace_is_configured,
-)
+from safety_config import DEFAULT_SPEED, MAX_TRANSLATIONAL_SPEED, REAL_TARGET, RETURN_SPEED, URSIM_TARGET, speed_for_profile, workspace_profile
 
 import cv2
-import mediapipe as mp
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPixmap
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QToolButton,
-    QSizePolicy,
-    QSlider,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QWidget
+
+from types import SimpleNamespace
+from vision_control.motion import MotionMixin
+from vision_control.ui import DashboardUiMixin
+from vision_control.settings import SettingsMixin
+from vision_control.logging import LoggingMixin
+from vision_control.transport import RTDEWorkerClient
+from vision_control.vision import VisionClient, CameraScanner, MANUAL_CAMERA
+from vision_control.gestures import zone_command
+from vision_control.policy import Mode, fresh, FRAME_TIMEOUT, RETURN_TIMEOUT
 
 cv2.setNumThreads(1)
 
@@ -71,130 +48,7 @@ SAFETY_MODE_ZH = {
 }
 
 
-def _rtde_worker(pipe, host: str) -> None:
-    """Own all ur-rtde native state in a crash-isolated child process."""
-    control = None
-    receive = None
-    try:
-        import rtde_control
-        import rtde_receive
-
-        # Establish feedback first. RTDEControlInterface starts a native
-        # reconnect thread, so defer it until the first motion command.
-        receive = rtde_receive.RTDEReceiveInterface(host)
-        pipe.send(("connected", ""))
-        control = None
-
-        def ensure_control():
-            nonlocal control
-            if control is None:
-                control = rtde_control.RTDEControlInterface(host)
-            return control
-        next_feedback_at = 0.0
-        while True:
-            now = time.monotonic()
-            if now >= next_feedback_at:
-                pipe.send((
-                    "pose",
-                    list(receive.getActualTCPPose()),
-                    int(receive.getSafetyMode()),
-                    int(receive.getRobotStatus()),
-                ))
-                next_feedback_at = now + 0.10
-            if not pipe.poll(0.02):
-                continue
-            message = pipe.recv()
-            action = message[0]
-            if action == "speed":
-                safe_velocity = cap_translational_velocity(message[1])
-                if safe_velocity is None:
-                    pipe.send(("error", "拒絕非有限或超過 0.5 m/s 向量"))
-                    break
-                ensure_control().speedL(safe_velocity, message[2], message[3])
-            elif action == "stop":
-                if control is not None:
-                    control.speedStop(message[1])
-            elif action == "close":
-                break
-    except Exception as exc:
-        try:
-            pipe.send(("error", str(exc)))
-        except Exception:
-            pass
-    finally:
-        # Do not call ur-rtde disconnect here after an EOF; process teardown
-        # safely reclaims the native socket without touching its reconnecter.
-        try:
-            pipe.close()
-        except Exception:
-            pass
-
-
-class RTDEWorkerClient:
-    def __init__(self, host: str) -> None:
-        context = mp_process.get_context("spawn")
-        self.parent_pipe, child_pipe = context.Pipe()
-        self.process = context.Process(target=_rtde_worker, args=(child_pipe, host), daemon=True)
-        self.process.start()
-        child_pipe.close()
-        self.connected = False
-        self.error = ""
-        self.actual_tcp_pose: Optional[tuple[float, float, float, float, float, float]] = None
-        self.pose_received_at = 0.0
-        self.safety_status: Optional[int] = None
-        self.robot_status: Optional[int] = None
-
-    def poll(self) -> Optional[tuple[str, str]]:
-        event_to_return = None
-        try:
-            while self.parent_pipe.poll():
-                event = self.parent_pipe.recv()
-                if event[0] == "connected":
-                    self.connected = True
-                    event_to_return = event
-                elif event[0] == "pose":
-                    self.actual_tcp_pose = tuple(float(value) for value in event[1])
-                    self.pose_received_at = time.monotonic()
-                    self.safety_status = int(event[2])
-                    self.robot_status = int(event[3])
-                elif event[0] == "error":
-                    self.connected = False
-                    self.error = event[1]
-                    event_to_return = event
-        except (EOFError, OSError) as exc:
-            self.connected = False
-            self.error = str(exc)
-            return ("error", self.error)
-        if event_to_return is not None:
-            return event_to_return
-        if not self.process.is_alive():
-            self.error = "RTDE worker exited unexpectedly"
-            self.connected = False
-            return ("error", self.error)
-        return None
-
-    def speedL(self, velocity, acceleration, period) -> None:
-        if self.connected and self.process.is_alive():
-            self.parent_pipe.send(("speed", velocity, acceleration, period))
-
-    def speedStop(self, deceleration) -> None:
-        if self.connected and self.process.is_alive():
-            self.parent_pipe.send(("stop", deceleration))
-
-    def disconnect(self) -> None:
-        # Terminate the isolated process instead of invoking native teardown
-        # on the Qt/UI process after a possible reconnect crash.
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=0.5)
-        self.connected = False
-        try:
-            self.parent_pipe.close()
-        except Exception:
-            pass
-
-
-class UR10VisionQtApp(QMainWindow):
+class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin, QMainWindow):
     RTDE_PORT = 30004
     ACCELERATION = 0.25
     CONTROL_PERIOD = 0.10
@@ -202,46 +56,42 @@ class UR10VisionQtApp(QMainWindow):
     MIN_HAND_SIZE = 0.06
     MAX_HAND_SIZE = 0.85
     MIN_LANDMARK_SPREAD = 0.015
-    # Depth is judged relative to the calibrated palm span, not a fixed
-    # pixel-like value. A 6% change rejects jitter but accepts a real move.
-    DEPTH_RATIO_DEAD_ZONE = 0.06
     SIZE_SMOOTHING = 0.12
-    SIZE_CALIB_RATE = 0.04
-    LEFT_ZONE_END = 0.38
-    RIGHT_ZONE_START = 0.62
-    VERTICAL_ZONE_DEAD = 0.10
-    CONFIDENCE_GATE = 0.75
     COMMAND_CONFIRM_FRAMES = 6
     SAFETY_SPEED_CAP = MAX_TRANSLATIONAL_SPEED
 
-    # Workspace values come from safety_config profiles. URSim is the reviewed
-    # demonstration range; physical hardware is unset until measured.
+    # Installation values are validated without inventing or sorting bounds.
     POSE_FEEDBACK_TIMEOUT = 0.50
-    WALL_TOLERANCE = 0.002
-    WALL_SLOW_ZONE = 0.10
-    WALL_MIN_SCALE = 0.25
     AXIS_TEST_DISTANCE = 0.03
-    SAFE_ORIGIN = (0.40, 0.00, 0.40)
     SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
     RETURN_SPEED_CAP = RETURN_SPEED
+    RETURN_TIMEOUT = RETURN_TIMEOUT
     RETURN_POSITION_TOLERANCE = 0.010
     REAL_CHECKLIST_ITEMS = (
         "實體工作區已清空，機械人活動範圍內沒有人。",
         "實體緊急停止按鈕就在手邊，並已測試有效。",
-        "PolyScope 狀態列顯示 Remote（遠端控制已啟用）。",
         "控制器上已設定安全平面／保護性停止。",
         "速度設定已在控制關閉時由操作者明確選擇；0.5 m/s 僅為軟體可設定上限，不代表安全或已驗證。",
     )
+    # e-Series only: CB3 (PolyScope 3.x) has no Remote Control mode at all.
+    REAL_REMOTE_CHECKLIST_ITEM = "PolyScope 狀態列顯示 Remote（遠端控制已啟用）。"
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("UR10 Vision Control")
-        self.resize(1320, 860)
-        self.setMinimumSize(1080, 700)
+        self.resize(1440, 900)
+        self.setMinimumSize(1000, 720)
+        self.theme = 'light'
 
-        self.cap: Optional[cv2.VideoCapture] = None
+        self.vision = None
+        self.scanner = None
+        self.camera_state = mp_process.get_context("spawn").Array('d', 2, lock=True)
+        self.frame_acquired_at = 0.0
+        self.mode = Mode.DISABLED
+        self._last_dispatched = None
+        self._stop_request_failed = False
+        self._last_stop_ack = -1
         self.robot = None
         self.rtde_client: Optional[RTDEWorkerClient] = None
-        self.hands = None
         self.camera_running = False
         self.robot_enabled = False
         self.connection_in_progress = False
@@ -253,11 +103,9 @@ class UR10VisionQtApp(QMainWindow):
         self.selected_real_speed = DEFAULT_SPEED
         self._workspace_profile = workspace_profile(URSIM_TARGET)
         self.last_robot_update = 0.0
-        self.last_frame_time = 0.0
-        self.last_fps_time = time.monotonic()
+        self.last_fps_time = monotonic()
         self.fps_frames = 0
         self.current_fps = 0.0
-        self.camera_failures = 0
         self.lost_hand_frames = 0
         self.smooth_x: Optional[float] = None
         self.smooth_y: Optional[float] = None
@@ -285,15 +133,10 @@ class UR10VisionQtApp(QMainWindow):
         self.pending_command = "STOP"
         self.pending_command_frames = 0
         self.stable_command = "STOP"
-        self.test_steps = 0
-        self.test_vector = (0.02, 0.0, 0.0)
 
         self._setup_csv_logging()
         self._last_frame_command = "STOP"
-        self._last_frame_sent = (0.0, 0.0, 0.0)
 
-        self.mp_draw = mp.solutions.drawing_utils
-        self.mp_hands = mp.solutions.hands
 
         self.frame_timer = QTimer(self)
         self.frame_timer.timeout.connect(self.update_frame)
@@ -302,432 +145,27 @@ class UR10VisionQtApp(QMainWindow):
         self.rtde_timer = QTimer(self)
         self.rtde_timer.timeout.connect(self._poll_rtde)
 
+        self._loading_settings = False
         self._build_ui()
         self._apply_style()
         self._load_settings()
+        QApplication.instance().installEventFilter(self)
+        self.rtde_timer.start(50)
         self.log(f"CSV 記錄：{self.csv_path}")
         self.log("就緒。請先連接 URSim，再啟動控制。")
-        self.log("請張開手掌放於畫面中央以校準手掌大小。")
+        self.log("請開啟相機並按「校準中立姿態」，完成後才啟動手勢控制。")
+        self.log(self._workspace_summary())
         self._update_status()
 
     # --- UI ------------------------------------------------------------
 
-    def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(18, 16, 18, 14)
-        root.setSpacing(12)
+    def eventFilter(self, watched, event):
+        # Window shortcuts are blocked by modal dialogs. Keep Escape's STOP
+        # active there too, while still allowing the dialog to handle Escape.
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            self.emergency_stop()
+        return super().eventFilter(watched, event)
 
-        header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel("UR10 視覺控制系統")
-        title.setObjectName("title")
-        subtitle = QLabel("安全分區：左＝左移 ｜ 中央＝手掌大小控制前後 ｜ 右＝右移")
-        subtitle.setObjectName("subtitle")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box)
-        header.addStretch()
-        self.status_banner = QLabel("就緒 | 模擬模式")
-        self.status_banner.setObjectName("statusBanner")
-        self.status_banner.setAlignment(Qt.AlignCenter)
-        self.status_banner.setMinimumWidth(290)
-        header.addWidget(self.status_banner)
-        root.addLayout(header)
-
-        main = QHBoxLayout()
-        main.setSpacing(14)
-
-        video_card = self._card()
-        video_layout = QVBoxLayout(video_card)
-        video_layout.setContentsMargins(12, 12, 12, 12)
-        video_layout.setSpacing(8)
-        video_layout.addWidget(self._section_label("視覺預覽"))
-        self.video_label = QLabel("相機未開啟")
-        self.video_label.setObjectName("video")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(620, 470)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        video_layout.addWidget(self.video_label, 1)
-        main.addWidget(video_card, 1)
-
-        side = QVBoxLayout()
-        side.setSpacing(10)
-        self.side_tabs = QTabWidget()
-        self.side_tabs.setObjectName("sideTabs")
-        self.side_tabs.addTab(self._wrap_in_tab(self._build_camera_card()), "攝影機")
-        self.side_tabs.addTab(self._wrap_in_tab(self._build_robot_card()), "連接")
-        self.side_tabs.addTab(self._wrap_in_tab(self._build_axis_card()), "單軸測試")
-        self.side_tabs.setMinimumWidth(330)
-        self.side_tabs.setMaximumWidth(390)
-        side.addWidget(self.side_tabs, 1)
-        main.addLayout(side, 0)
-        root.addLayout(main, 1)
-
-        # Keep status full-width so the connection controls never get
-        # vertically compressed on smaller laptop screens.
-        root.addWidget(self._build_status_card())
-
-        self._build_advanced_section(root)
-
-        footer = QLabel("安全提示：握拳／沒有手＝停止。請先在 URSim 完成測試，才考慮實體機械人。")
-        footer.setObjectName("footer")
-        root.addWidget(footer)
-
-    def _wrap_in_tab(self, widget: QWidget) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(6, 10, 6, 6)
-        layout.addWidget(widget)
-        layout.addStretch()
-        return container
-
-    def _build_advanced_section(self, root: QVBoxLayout) -> None:
-        self.advanced_toggle = QToolButton()
-        self.advanced_toggle.setText("進階控制（調校／事件日誌）  ▸")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setChecked(False)
-        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.advanced_toggle.clicked.connect(self._toggle_advanced)
-        root.addWidget(self.advanced_toggle)
-
-        self.advanced_content = QWidget()
-        advanced_layout = QVBoxLayout(self.advanced_content)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
-        advanced_layout.setSpacing(8)
-        advanced_layout.addWidget(self._build_tuning_card())
-
-        log_card = self._card()
-        log_layout = QVBoxLayout(log_card)
-        log_layout.setContentsMargins(12, 8, 12, 8)
-        log_layout.addWidget(self._section_label("事件日誌"))
-        self.event_log = QPlainTextEdit()
-        self.event_log.setObjectName("eventLog")
-        self.event_log.setReadOnly(True)
-        self.event_log.setMaximumBlockCount(50)
-        self.event_log.setFixedHeight(82)
-        log_layout.addWidget(self.event_log)
-        advanced_layout.addWidget(log_card)
-        self.advanced_content.setVisible(False)
-        root.addWidget(self.advanced_content)
-
-    def _toggle_advanced(self, checked: bool) -> None:
-        self.advanced_content.setVisible(checked)
-        self.advanced_toggle.setText("進階控制（調校／事件日誌）  ▾" if checked else "進階控制（調校／事件日誌）  ▸")
-
-    def _card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
-        return card
-
-    def _section_label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("section")
-        return label
-
-    def _build_camera_card(self) -> QFrame:
-        card = self._card()
-        # Four controls need real vertical room; without this Qt compresses
-        # the newly added calibration buttons into blank-looking strips.
-        card.setMinimumHeight(226)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
-        layout.addWidget(self._section_label("攝影機"))
-        self.camera_combo = QComboBox()
-        self.camera_combo.addItems(["0", "<手動輸入>"])
-        self.camera_combo.currentTextChanged.connect(self._camera_source_changed)
-        layout.addWidget(self.camera_combo)
-        self.camera_source = QLineEdit("0")
-        self.camera_source.setPlaceholderText("0 或 RTSP URL")
-        self.camera_source.setVisible(False)
-        layout.addWidget(self.camera_source)
-        scan_row = QHBoxLayout()
-        scan_row.setSpacing(6)
-        self.scan_button = QPushButton("掃描相機")
-        self.scan_button.setMinimumHeight(26)
-        self.scan_button.clicked.connect(self._scan_cameras)
-        scan_row.addWidget(self.scan_button)
-        scan_row.addStretch()
-        layout.addLayout(scan_row)
-        self.camera_button = QPushButton("開啟相機")
-        self.camera_button.setMinimumHeight(28)
-        self.camera_button.setObjectName("primaryButton")
-        self.camera_button.clicked.connect(self.toggle_camera)
-        layout.addWidget(self.camera_button)
-        self.calibrate_button = QPushButton("校準中立姿態")
-        self.calibrate_button.setMinimumHeight(28)
-        self.calibrate_button.setEnabled(False)
-        self.calibrate_button.clicked.connect(self.start_calibration)
-        layout.addWidget(self.calibrate_button)
-        self.zones_button = QPushButton("分區顯示：隱藏")
-        self.zones_button.setMinimumHeight(28)
-        self.zones_button.clicked.connect(self.toggle_zones)
-        layout.addWidget(self.zones_button)
-        self.depth_button = QPushButton("深度方向：正常")
-        self.depth_button.setMinimumHeight(28)
-        self.depth_button.setEnabled(False)
-        self.depth_button.clicked.connect(self.toggle_depth_direction)
-        layout.addWidget(self.depth_button)
-        return card
-
-    def _build_robot_card(self) -> QFrame:
-        card = self._card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
-        layout.addWidget(self._section_label("UR10 連接"))
-
-        self.target_combo = QComboBox()
-        self.target_combo.addItems(["URSim", "實體 UR10"])
-        self.target_combo.currentTextChanged.connect(self._target_changed)
-        layout.addWidget(self.target_combo)
-
-        self.robot_ip = QLineEdit("127.0.0.1")
-        self.robot_ip.setPlaceholderText("UR 控制器 IP")
-        layout.addWidget(self.robot_ip)
-
-        self.connect_button = QPushButton("連接機械人")
-        self.connect_button.setMinimumHeight(30)
-        self.connect_button.setObjectName("primaryButton")
-        self.connect_button.clicked.connect(self.connect_robot)
-        layout.addWidget(self.connect_button)
-
-        self.enable_button = QPushButton("啟動機械人控制")
-        self.enable_button.setMinimumHeight(30)
-        self.enable_button.setObjectName("enableButton")
-        self.enable_button.clicked.connect(self.toggle_robot_control)
-        layout.addWidget(self.enable_button)
-
-        self.stop_button = QPushButton("急停")
-        self.stop_button.setMinimumHeight(30)
-        self.stop_button.setObjectName("stopButton")
-        self.stop_button.clicked.connect(self.emergency_stop)
-        layout.addWidget(self.stop_button)
-
-        self.invert_button = QPushButton("移動方向：正常")
-        self.invert_button.setMinimumHeight(28)
-        self.invert_button.clicked.connect(self.toggle_direction_invert)
-        layout.addWidget(self.invert_button)
-
-        self.test_button = QPushButton("測試移動（1 秒）")
-        self.test_button.setMinimumHeight(28)
-        self.test_button.clicked.connect(self.test_ursim_motion)
-        self.test_button.setEnabled(False)
-        layout.addWidget(self.test_button)
-        return card
-
-    def _build_axis_card(self) -> QFrame:
-        card = self._card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
-        layout.addWidget(self._section_label("單軸測試"))
-        hint = QLabel(f"每按一下移動 {self.AXIS_TEST_DISTANCE * 100:.0f} cm，以可設定速度上限 {self.SAFETY_SPEED_CAP:.2f} m/s 執行。需先連接並啟動控制。")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        axis_grid = QGridLayout()
-        axis_grid.setSpacing(8)
-        self.axis_buttons: dict[str, QPushButton] = {}
-        for index, (label, vector) in enumerate((
-                ("+X", (1, 0, 0)), ("+Y", (0, 1, 0)), ("+Z", (0, 0, 1)),
-                ("−X", (-1, 0, 0)), ("−Y", (0, -1, 0)), ("−Z", (0, 0, -1)))):
-            button = QPushButton(label)
-            button.setMinimumHeight(40)
-            button.setObjectName("axisButton")
-            button.setEnabled(False)
-            button.clicked.connect(
-                lambda _=False, vec=vector: self.axis_test(*vec))
-            row, col = divmod(index, 3)
-            axis_grid.addWidget(button, row, col)
-            self.axis_buttons[label] = button
-        layout.addLayout(axis_grid)
-        layout.addStretch()
-        return card
-
-    def _build_status_card(self) -> QFrame:
-        card = self._card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
-        layout.addWidget(self._section_label("即時狀態"))
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
-        self.status_values: dict[str, QLabel] = {}
-        tile_titles = {
-            "Robot": "機械人", "Control": "控制", "Command": "指令",
-            "Hand": "手掌", "Confidence": "信心", "FPS": "帧率",
-        }
-        for index, key in enumerate(("Robot", "Control", "Command", "Hand", "Confidence", "FPS")):
-            row, col = divmod(index, 3)
-            tile = QFrame()
-            tile.setObjectName("tile")
-            tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(10, 6, 10, 6)
-            tile_layout.setSpacing(2)
-            title = QLabel(tile_titles[key])
-            title.setObjectName("statusKey")
-            value = QLabel("--")
-            value.setObjectName("statusValue")
-            value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            tile_layout.addWidget(title)
-            tile_layout.addWidget(value)
-            grid.addWidget(tile, row, col)
-            self.status_values[key] = value
-        layout.addLayout(grid)
-        telemetry_row = QHBoxLayout()
-        telemetry_row.setSpacing(10)
-        self.tcp_label = QLabel("TCP: --")
-        self.tcp_label.setObjectName("telemetry")
-        telemetry_row.addWidget(self.tcp_label, 2)
-        self.safety_label = QLabel("安全模式: --")
-        self.safety_label.setObjectName("telemetry")
-        telemetry_row.addWidget(self.safety_label, 1)
-        self.csv_indicator = QLabel("○ CSV 未啟用")
-        self.csv_indicator.setObjectName("telemetry")
-        telemetry_row.addWidget(self.csv_indicator, 2)
-        layout.addLayout(telemetry_row)
-        bottom = QHBoxLayout()
-        self.confidence_bar = QLabel("[----------] 0%")
-        self.confidence_bar.setObjectName("meter")
-        bottom.addWidget(self.confidence_bar, 1)
-        self.direction_badge = QLabel("停止")
-        self.direction_badge.setObjectName("directionBadge")
-        self.direction_badge.setAlignment(Qt.AlignCenter)
-        self.direction_badge.setMinimumWidth(140)
-        self.direction_badge.setMinimumHeight(36)
-        bottom.addWidget(self.direction_badge)
-        layout.addLayout(bottom)
-        self.workspace_status = QLabel("工作區：未設定 | 實際控制鎖定")
-        self.workspace_status.setObjectName("workspaceStatus")
-        self.workspace_status.setProperty("state", "warn")
-        self.workspace_status.setWordWrap(True)
-        layout.addWidget(self.workspace_status)
-        return card
-
-    def _build_tuning_card(self) -> QFrame:
-        card = self._card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(8)
-        layout.addWidget(self._section_label("調校"))
-        row = QHBoxLayout()
-        row.setSpacing(14)
-        self.tuners: dict[str, tuple[QSlider, QLabel, float]] = {}
-        self._add_tuner(row, "Detection", "偵測信心", 50, 95, 80, 1, 100.0)
-        self._add_tuner(row, "Tracking", "追蹤信心", 30, 95, 60, 1, 100.0)
-        self._add_tuner(row, "Smoothing", "平滑度", 5, 80, 25, 1, 100.0)
-        self._add_tuner(row, "Dead zone", "死區", 3, 30, 10, 1, 100.0)
-        self._add_tuner(row, "Max speed", "最高速度（可設定上限）", 1, 50, 2, 2, 100.0)
-        self._add_tuner(row, "Size sensitivity", "手掌敏感度", 10, 80, 30, 1, 10.0)
-        self.tuners["Max speed"][0].valueChanged.connect(self._max_speed_changed)
-        layout.addLayout(row)
-        return card
-
-    def _add_tuner(self, row: QHBoxLayout, name: str, label_zh: str, minimum: int, maximum: int,
-                   value: int, step: int, scale: float) -> None:
-        box = QVBoxLayout()
-        box.setSpacing(3)
-        title = QLabel(label_zh)
-        title.setObjectName("tunerLabel")
-        value_label = QLabel()
-        value_label.setObjectName("tunerValue")
-        slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(minimum)
-        slider.setMaximum(maximum)
-        slider.setSingleStep(step)
-        slider.setValue(value)
-        slider.valueChanged.connect(lambda v, label=value_label, s=scale: label.setText(f"{v / s:.2f}"))
-        value_label.setText(f"{value / scale:.2f}")
-        box.addWidget(title)
-        box.addWidget(value_label)
-        box.addWidget(slider)
-        row.addLayout(box, 1)
-        self.tuners[name] = (slider, value_label, scale)
-
-    def _apply_style(self) -> None:
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #0b1220; color: #f8fafc;
-                font-family: 'PingFang TC', 'Heiti TC', Arial; }
-            QFrame#card { background: #16203a; border: 1px solid #24314f;
-                border-radius: 12px; }
-            QLabel#title { font-size: 24px; font-weight: 700; color: #f8fafc; }
-            QLabel#subtitle, QLabel#footer { font-size: 12px; color: #7c8db0; }
-            QLabel#hint { font-size: 12px; color: #94a3b8; }
-            QLabel#section { font-size: 12px; font-weight: 700; color: #8ab4f8;
-                letter-spacing: 1px; }
-            QLabel#statusBanner { background: #1e2a45; color: #e2e8f0;
-                border: 1px solid #2c3c63; border-radius: 8px; padding: 10px 14px;
-                font-weight: 600; font-size: 14px; }
-            QLabel#statusBanner[state="live"] { background: #123c2b; color: #6ee7a0;
-                border: 1px solid #1d5c43; }
-            QLabel#statusBanner[state="warn"] { background: #3f2f0d; color: #fbbf24;
-                border: 1px solid #6b5216; }
-            QLabel#statusBanner[state="error"] { background: #44141a; color: #fca5a5;
-                border: 1px solid #7a2029; }
-            QLabel#video { background: #060b18; color: #64748b;
-                border: 1px solid #24314f; border-radius: 8px; font-size: 16px; }
-            QLineEdit, QComboBox { background: #0e1730; border: 1px solid #33436b;
-                border-radius: 7px; padding: 8px; color: #f8fafc; min-height: 18px; }
-            QLineEdit:focus, QComboBox:focus { border: 1px solid #38bdf8; }
-            QComboBox QAbstractItemView { background: #16203a;
-                selection-background-color: #2563eb; color: #f8fafc; }
-            QPushButton { background: #24314f; color: #f8fafc; border: 0;
-                border-radius: 7px; padding: 9px; font-weight: 600; }
-            QPushButton:hover { background: #2f4166; }
-            QPushButton:pressed { background: #1b2740; }
-            QToolButton { background: #1e2a45; color: #f8fafc;
-                border: 1px solid #33436b; border-radius: 7px; padding: 9px;
-                font-weight: 600; text-align: left; }
-            QToolButton:hover { background: #24314f; }
-            QPushButton:disabled { color: #55627e; background: #1a2338; }
-            QPushButton#primaryButton { background: #2563eb; color: white; }
-            QPushButton#primaryButton:hover { background: #3b76f5; }
-            QPushButton#primaryButton:pressed { background: #1d4fc4; }
-            QPushButton#enableButton { background: #16803c; color: white; }
-            QPushButton#enableButton:hover { background: #1b9c49; }
-            QPushButton#stopButton { background: #b91c1c; color: white; font-size: 15px; }
-            QPushButton#stopButton:hover { background: #dc2626; }
-            QPushButton#axisButton { font-size: 15px; font-weight: 700;
-                background: #1e2a45; border: 1px solid #33436b; }
-            QPushButton#axisButton:hover { background: #2f4166;
-                border: 1px solid #38bdf8; }
-            QTabWidget#sideTabs::pane { border: 1px solid #24314f;
-                border-radius: 10px; background: #101a33; top: -1px; }
-            QTabBar::tab { background: #131e38; color: #7c8db0; padding: 8px 14px;
-                border-top-left-radius: 7px; border-top-right-radius: 7px;
-                font-weight: 600; }
-            QTabBar::tab:selected { background: #16203a; color: #8ab4f8; }
-            QFrame#tile { background: #101a33; border: 1px solid #24314f;
-                border-radius: 8px; }
-            QLabel#statusKey { color: #7c8db0; font-size: 11px; }
-            QLabel#statusValue { color: #f8fafc; font-weight: 700; font-size: 14px;
-                font-family: Menlo, 'PingFang TC'; }
-            QLabel#telemetry { color: #94a3b8; font-size: 12px;
-                font-family: Menlo, 'PingFang TC'; }
-            QLabel#meter { background: #0e1730; color: #34d399; border-radius: 6px;
-                padding: 6px 9px; font-family: Menlo; font-size: 13px; }
-            QLabel#directionBadge { background: #334155; border-radius: 8px;
-                padding: 6px 14px; font-weight: 700; font-size: 17px; }
-            QLabel#workspaceStatus[state="ok"] { background: #0e2b1f; color: #34d399;
-                border-radius: 7px; padding: 8px; font-weight: 700; }
-            QLabel#workspaceStatus[state="warn"] { background: #0e1730; color: #fbbf24;
-                border-radius: 7px; padding: 8px; font-weight: 700; }
-            QLabel#workspaceStatus[state="error"] { background: #3d1216; color: #f87171;
-                border-radius: 7px; padding: 8px; font-weight: 700; }
-            QLabel#tunerLabel { color: #7c8db0; font-size: 11px; }
-            QLabel#tunerValue { color: #f8fafc; font-size: 12px; font-weight: 700; }
-            QSlider::groove:horizontal { background: #24314f; height: 6px;
-                border-radius: 3px; }
-            QSlider::handle:horizontal { background: #38bdf8; width: 15px;
-                margin: -5px 0; border-radius: 7px; }
-            QPlainTextEdit#eventLog { background: #0e1730; border: 0;
-                border-radius: 7px; color: #9fb3d8; font-family: Menlo, 'PingFang TC';
-                font-size: 11px; padding: 6px; }
-        """)
 
     # --- Parameters and status ---------------------------------------
 
@@ -744,21 +182,24 @@ class UR10VisionQtApp(QMainWindow):
         connected = bool(self.rtde_client and self.rtde_client.connected)
         robot = f"{self.target_combo.currentText()} | " + ("已連接" if connected else "未連接")
         self.status_values["Robot"].setText(robot)
-        self.status_values["Control"].setText("已啟動" if self.robot_enabled else "關閉")
-        self.status_values["Command"].setText(COMMAND_ZH.get(command, command))
+        self.status_values["Control"].setText({Mode.DISABLED:"關閉", Mode.READY:"待命", Mode.GESTURE:"手勢", Mode.AXIS_TEST:"單軸測試", Mode.RETURN:"返回原點", Mode.FAULT:"故障鎖定"}[self.mode])
+        dispatched = getattr(self.rtde_client, 'dispatched_velocity', None)
+        control_command = self._command_name(*dispatched[:3]) if connected and dispatched else 'STOP'
+        command_display = '＋'.join(COMMAND_ZH.get(part, part) for part in control_command.split('+'))
+        if connected and getattr(self.rtde_client, 'stop_pending', False):
+            command_display = '停止待確認'
+        self.status_values["Command"].setText(command_display)
         self.status_values["Hand"].setText(hand)
         self.status_values["Confidence"].setText(f"{confidence * 100:.0f}%" if confidence else "--")
         self.status_values["FPS"].setText(f"{self.current_fps:.1f}")
-        filled = int(round(max(0.0, min(1.0, confidence)) * 10))
-        self.confidence_bar.setText(f"[{'#' * filled}{'-' * (10 - filled)}] {confidence * 100:.0f}%")
-        self.direction_badge.setText(COMMAND_ZH.get(command, command))
-        color = {
-            "STOP": "#334155", "LEFT": "#6b21a8", "RIGHT": "#166534",
-            "UP": "#1d4ed8", "DOWN": "#9a3412", "FWD": "#0f766e", "BACK": "#78350f",
-        }.get(command.split("+")[0], "#334155")
+        self.confidence_bar.setText("左右手分類分數僅供參考")
+        arrow = {"STOP": "■", "LEFT": "←", "RIGHT": "→", "UP": "↑", "DOWN": "↓", "FWD": "↗", "BACK": "↙"}.get(command, "↔")
+        gesture_display = '＋'.join(COMMAND_ZH.get(part, part) for part in command.split('+'))
+        self.direction_badge.setText(f"{arrow}  {gesture_display}")
+        color = "#223047" if command == "STOP" else "#315f9e"
         self.direction_badge.setStyleSheet(
-            f"background: {color}; border-radius: 8px; padding: 6px 14px;"
-            "font-weight: 700; font-size: 17px;")
+            f"background: {color}; border-radius: 4px; padding: 5px 10px;"
+            "font-weight: 600; font-size: 14px;")
         # Telemetry: TCP pose, safety mode, CSV state
         pose = self.rtde_client.actual_tcp_pose if self.rtde_client else None
         if pose is not None:
@@ -770,17 +211,17 @@ class UR10VisionQtApp(QMainWindow):
             self.safety_label.setText(f"安全模式: {SAFETY_MODE_ZH.get(safety, safety)}")
         else:
             self.safety_label.setText("安全模式: --")
-        if getattr(self, "csv_file", None) is not None:
+        if getattr(self, "csv_writer", None) is not None:
             self.csv_indicator.setText(f"● CSV 錄製中：{os.path.basename(self.csv_path)}")
         else:
             self.csv_indicator.setText("○ CSV 未啟用")
         # Status banner colour reflects real state regardless of its text.
-        if self.workspace_fault or self.rtde_lost:
+        if self.mode == Mode.FAULT or self.workspace_fault or self.rtde_lost:
             banner_state = "error"
-        elif self.robot_enabled:
-            banner_state = "live"
         elif self.returning_to_origin:
             banner_state = "warn"
+        elif self.robot_enabled:
+            banner_state = "live"
         else:
             banner_state = "idle"
         self.status_banner.setProperty("state", banner_state)
@@ -792,7 +233,7 @@ class UR10VisionQtApp(QMainWindow):
             workspace = "工作區：返回安全原點中"
             workspace_state = "warn"
         elif not self._workspace_is_configured():
-            workspace = "工作區：未設定 | 實際控制鎖定"
+            workspace = self._workspace_summary()
             workspace_state = "error"
         elif not connected:
             workspace = "工作區：已設定 | 機械人未連接"
@@ -806,6 +247,7 @@ class UR10VisionQtApp(QMainWindow):
         self.workspace_status.setText(workspace)
         self.workspace_status.setProperty("state", workspace_state)
         self._repolish(self.workspace_status)
+        self._refresh_workflow()
 
     def _target_changed(self, target: str) -> None:
         if self.connection_in_progress or self.rtde_client is not None:
@@ -842,13 +284,12 @@ class UR10VisionQtApp(QMainWindow):
         slider, _, _ = self.tuners["Max speed"]
         slider.setEnabled(enabled)
 
-    def _restore_physical_speed_selection(self) -> None:
-        self._setting_speed_profile = True
-        try:
-            slider, _, scale = self.tuners["Max speed"]
-            slider.setValue(int(round(self.selected_real_speed * scale)))
-        finally:
-            self._setting_speed_profile = False
+
+    def confirm_physical_speed(self):
+        if self.target_combo.currentText() == REAL_TARGET and not self.robot_enabled:
+            self.real_speed_selected = True
+            self.selected_real_speed = self._value('Max speed')
+            self.log(f'已明確選擇實體速度 {self.selected_real_speed:.2f} m/s')
 
     def _max_speed_changed(self, _value: int) -> None:
         if (getattr(self, "target_combo", None) is not None
@@ -860,132 +301,12 @@ class UR10VisionQtApp(QMainWindow):
             self.selected_real_speed = self._value("Max speed")
         self._save_settings()
 
-    def log(self, message: str) -> None:
-        self.event_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {message}")
-        self._csv_row("event", note=message)
 
     # --- CSV logging ----------------------------------------------------
 
-    def _setup_csv_logging(self) -> None:
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            self.csv_path = os.path.join(
-                log_dir, f"session_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-            self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow([
-                "timestamp", "event", "command", "vx", "vy", "vz",
-                "hand_x", "hand_y", "size_delta_pct", "confidence", "fps",
-                "tcp_x", "tcp_y", "tcp_z", "safety_mode", "robot_enabled", "note",
-            ])
-            self.csv_file.flush()
-        except OSError as exc:
-            self.csv_path = ""
-            self.csv_file = None
-            self.csv_writer = None
-
-    def _csv_row(self, event: str, command: str = "STOP",
-                 vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
-                 hand_x: Optional[float] = None, hand_y: Optional[float] = None,
-                 size_delta_pct: Optional[float] = None,
-                 confidence: float = 0.0, note: str = "") -> None:
-        if self.csv_writer is None:
-            return
-        pose = self.rtde_client.actual_tcp_pose if self.rtde_client else None
-        safety = self.rtde_client.safety_status if self.rtde_client else None
-        try:
-            self.csv_writer.writerow([
-                f"{time.time():.3f}", event, command,
-                f"{vx:+.4f}", f"{vy:+.4f}", f"{vz:+.4f}",
-                "" if hand_x is None else f"{hand_x:.4f}",
-                "" if hand_y is None else f"{hand_y:.4f}",
-                "" if size_delta_pct is None else f"{size_delta_pct:+.1f}",
-                f"{confidence:.3f}", f"{self.current_fps:.1f}",
-                "" if pose is None else f"{pose[0]:+.4f}",
-                "" if pose is None else f"{pose[1]:+.4f}",
-                "" if pose is None else f"{pose[2]:+.4f}",
-                "" if safety is None else int(safety),
-                int(self.robot_enabled), note,
-            ])
-        except Exception:
-            pass
-
-    def _flush_csv(self) -> None:
-        if self.csv_file is not None:
-            try:
-                self.csv_file.flush()
-                os.fsync(self.csv_file.fileno())
-            except Exception:
-                pass
 
     # --- Settings persistence -------------------------------------------
 
-    def _settings_data(self) -> dict:
-        return {
-            "target": self.target_combo.currentText(),
-            "robot_ip_ursim": self._ips.get("URSim", "127.0.0.1"),
-            "robot_ip_real": self._ips.get("實體 UR10", ""),
-            "direction_inverted": self.direction_inverted,
-            "depth_inverted": self.depth_inverted,
-            "camera_source": self.camera_combo.currentText(),
-            "camera_manual": self.camera_source.text(),
-            "max_speed": self._value("Max speed"),
-            "detection": self._value("Detection"),
-            "tracking": self._value("Tracking"),
-            "smoothing": self._value("Smoothing"),
-            "dead_zone": self._value("Dead zone"),
-            "size_sensitivity": self._value("Size sensitivity"),
-        }
-
-    def _load_settings(self) -> None:
-        self._ips = {"URSim": "127.0.0.1", "實體 UR10": ""}
-        try:
-            with open(self.SETTINGS_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return
-        self._ips["URSim"] = data.get("robot_ip_ursim", self._ips["URSim"])
-        self._ips["實體 UR10"] = data.get("robot_ip_real", self._ips["實體 UR10"])
-        target = data.get("target", URSIM_TARGET)
-        self.target_combo.setCurrentText(target if target in (URSIM_TARGET, REAL_TARGET) else URSIM_TARGET)
-        self._apply_target_profile(self.target_combo.currentText(), data.get("max_speed"))
-        self.robot_ip.setText(self._ips.get(self.target_combo.currentText(), "127.0.0.1"))
-        self.direction_inverted = bool(data.get("direction_inverted", False))
-        self.invert_button.setText(
-            f"Robot directions: {'inverted' if self.direction_inverted else 'normal'}")
-        self.depth_inverted = bool(data.get("depth_inverted", False))
-        self.depth_button.setText(
-            f"Depth direction: {'inverted' if self.depth_inverted else 'normal'}")
-        camera = data.get("camera_source")
-        if camera:
-            index = self.camera_combo.findText(camera)
-            if index >= 0:
-                self.camera_combo.setCurrentIndex(index)
-            else:
-                self.camera_combo.setCurrentText("<Manual entry>")
-                self.camera_source.setText(camera)
-        manual = data.get("camera_manual")
-        if manual:
-            self.camera_source.setText(manual)
-        for key, name in (("detection", "Detection"), ("tracking", "Tracking"),
-                          ("smoothing", "Smoothing"), ("dead_zone", "Dead zone"),
-                          ("size_sensitivity", "Size sensitivity")):
-            value = data.get(key)
-            if value is not None:
-                slider, value_label, scale = self.tuners[name]
-                slider.setValue(int(round(float(value) * scale)))
-        self.log(f"已從 {os.path.basename(self.SETTINGS_PATH)} 載入設定")
-
-    def _save_settings(self) -> None:
-        if not hasattr(self, "_ips"):
-            return
-        self._ips[self.target_combo.currentText()] = self.robot_ip.text().strip()
-        try:
-            with open(self.SETTINGS_PATH, "w", encoding="utf-8") as fh:
-                json.dump(self._settings_data(), fh, indent=2)
-        except OSError as exc:
-            self.log(f"設定儲存失敗: {exc}")
 
     # --- Robot ---------------------------------------------------------
 
@@ -1015,7 +336,7 @@ class UR10VisionQtApp(QMainWindow):
                 pass
             if self.session_identity != identity:
                 return
-            self.rtde_client = RTDEWorkerClient(host)
+            self.rtde_client = RTDEWorkerClient(host, target, self.camera_state)
             self.robot = self.rtde_client
             self.rtde_lost = False
             self.connect_button.setText("取消連接")
@@ -1038,84 +359,96 @@ class UR10VisionQtApp(QMainWindow):
                 self.robot_ip.setEnabled(True)
         self._update_status()
 
-    def _poll_rtde(self) -> None:
+
+    def _poll_rtde(self):
+        self._poll_scanner()
         if self.rtde_client is None:
-            self.rtde_timer.stop()
+            self._refresh_workflow()
             return
         event = self.rtde_client.poll()
-        if event is None:
-            return
-        if event[0] == "connected":
-            if self.session_identity is None:
-                self._disconnect_robot()
-                return
+        for notice in self.rtde_client.notices:
+            self.log(notice)
+        self.rtde_client.notices.clear()
+        if event and event[0] == 'connected':
             self.connect_button.setText("中斷連線")
-            self.test_button.setEnabled(self.session_identity[0] == URSIM_TARGET)
-            for button in self.axis_buttons.values():
-                button.setEnabled(True)
-            self.status_banner.setText("機械人已連接 | 控制關閉")
-            self.log("RTDE 已連接")
-            self._update_status()
-        else:
-            self.rtde_timer.stop()
-            self.robot_enabled = False
-            self._set_speed_editor_enabled(True)
-            self.rtde_lost = True
-            self.enable_button.setText("啟動機械人控制")
-            self.status_banner.setText("RTDE 失敗 | 控制關閉")
-            self.log(f"RTDE 工作程序錯誤: {event[1]}")
-            self._update_status()
+            self.status_banner.setText("姿態已連接 | 等待控制介面就緒")
+            self.log("RTDE 已連接；請在控制器確認電源及操作模式")
+        elif event and event[0] in ('error', 'fault'):
+            self.rtde_lost = event[0] == 'error'
+            self._trip_workspace_fault(event[1])
+        if self.robot_enabled and self.mode != Mode.READY:
+            if not self._workspace_feedback_is_fresh() or not self._workspace_safety_status_is_acceptable():
+                self._trip_workspace_fault("TCP 姿態或安全回饋不可用")
+        sim_ready = (self.session_identity is not None and self.session_identity[0] == URSIM_TARGET
+                     and self.rtde_client.connected and self.rtde_client.control_ready)
+        self.test_button.setEnabled(sim_ready)
+        for button in self.axis_buttons.values():
+            button.setEnabled(sim_ready)
+        dispatched = self.rtde_client.dispatched_velocity
+        if dispatched != self._last_dispatched:
+            self._csv_row('worker_dispatch', command=self._command_name(*dispatched[:3]),
+                          vx=dispatched[0], vy=dispatched[1], vz=dispatched[2],
+                          note='RTDE call accepted; not measured velocity')
+            self._last_dispatched = dispatched
+        if self.rtde_client.stop_ack > self._last_stop_ack:
+            self._last_stop_ack = self.rtde_client.stop_ack
+            if self.mode == Mode.DISABLED and not self._stop_request_failed and not self.rtde_client.stop_pending:
+                self.status_banner.setText('STOP 已由控制器接受 | 控制關閉')
+        self._update_status(self._last_frame_command, getattr(self,"_last_hand_display","-, -"), getattr(self,"_last_handedness",0.0))
 
-    def _disconnect_robot(self) -> None:
+    def _disconnect_robot(self):
         if self.rtde_cleanup_in_progress:
             return
         self.rtde_cleanup_in_progress = True
-        robot = self.robot
-        self.robot = None
+        self._set_mode(Mode.DISABLED)
         worker = self.rtde_client
-        self.rtde_client = None
-        self.session_identity = None
-        self.robot_enabled = False
-        self._set_speed_editor_enabled(True)
-        self.test_timer.stop()
-        self.rtde_timer.stop()
         if worker is not None:
             worker.disconnect()
+        self.robot = self.rtde_client = None
+        self.session_identity = None
+        self.session_profile = None
         self.connect_button.setText("連接機械人")
-        self.enable_button.setText("啟動機械人控制")
         self.test_button.setEnabled(False)
         self.target_combo.setEnabled(True)
         self.robot_ip.setEnabled(True)
         for button in self.axis_buttons.values():
             button.setEnabled(False)
-        self.status_banner.setText("機械人未連接 | 模擬模式")
+        self.status_banner.setText("機械人未連接 | 控制關閉")
         self.log("機械人已斷線")
-        self._update_status()
         self.rtde_lost = False
         self.rtde_cleanup_in_progress = False
+        self._update_status()
 
-    def _confirm_real_robot_checklist(self) -> bool:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("實體 UR10 安全檢查清單")
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(
-            "啟動實體機械人移動前，請逐項確認以下安全事項："))
-        checkboxes = []
-        for item in self.REAL_CHECKLIST_ITEMS:
-            checkbox = QCheckBox(item)
-            checkboxes.append(checkbox)
-            layout.addWidget(checkbox)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("全部確認")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        confirmed = dialog.exec() == QDialog.Accepted and all(
-            box.isChecked() for box in checkboxes)
-        if not confirmed:
-            self.log("實體 UR10 檢查清單未完全確認；控制保持關閉")
-        return confirmed
+
+    def _dashboard_polyscope_version(self, host: str) -> Optional[tuple[int, int, int]]:
+        """Query the dashboard server for the controller's PolyScope version.
+
+        PolyScope 3.x means a CB3 controller, which has no Remote Control
+        mode at all; 5.x means e-Series. Returns None when the version
+        cannot be parsed, in which case callers must assume e-Series.
+        """
+        try:
+            with socket.create_connection((host, 29999), timeout=2.0) as sock:
+                sock.settimeout(2.0)
+                sock.sendall(b"PolyscopeVersion\n")
+                data = b""
+                deadline = monotonic() + 2.0
+                while monotonic() < deadline and len(data) < 4096:
+                    chunk = sock.recv(512)
+                    if not chunk:
+                        break
+                    data += chunk
+                    for raw_line in data.decode("utf-8", "ignore").splitlines():
+                        line = raw_line.strip()
+                        if line.lower().startswith("connected"):
+                            continue
+                        match = re.search(r"(\d+)\.(\d+)\.(\d+)", line)
+                        if match:
+                            major, minor, build = (int(part) for part in match.groups())
+                            return (major, minor, build)
+                return None
+        except OSError:
+            return None
 
     def _dashboard_remote_state(self, host: str) -> Optional[bool]:
         """Read a bounded dashboard reply, skipping the initial greeting."""
@@ -1124,9 +457,9 @@ class UR10VisionQtApp(QMainWindow):
                 sock.settimeout(2.0)
                 sock.sendall(b"is in remote control\n")
                 data = b""
-                deadline = time.monotonic() + 2.0
+                deadline = monotonic() + 2.0
                 result: Optional[bool] = None
-                while time.monotonic() < deadline and len(data) < 4096:
+                while monotonic() < deadline and len(data) < 4096:
                     chunk = sock.recv(512)
                     if not chunk:
                         break
@@ -1143,153 +476,6 @@ class UR10VisionQtApp(QMainWindow):
         except OSError:
             return None
 
-    def toggle_robot_control(self) -> None:
-        if self.rtde_client is None or not self.rtde_client.connected:
-            QMessageBox.warning(self, "機械人未連接", "請先連接 URSim 或 UR10。")
-            return
-        if not self.robot_enabled:
-            answer = QMessageBox.question(
-                self, "啟動機械人移動",
-                "請先確認機械人工作區已清空，才繼續。確定啟動？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
-            if self.session_identity is None or self.session_identity[0] != self.target_combo.currentText():
-                QMessageBox.warning(self, "連線目標已變更", "連線期間禁止變更控制目標。")
-                return
-            if self.session_identity[0] == REAL_TARGET:
-                if not self.real_speed_selected:
-                    QMessageBox.warning(
-                        self, "需要確認實體速度",
-                        "請在控制保持關閉時，明確設定實體機械人的速度；"
-                        "已儲存的速度不會自動沿用。")
-                    self.log("已封鎖實體控制：尚未明確選擇速度")
-                    return
-                remote = self._dashboard_remote_state(self.session_identity[1])
-                if remote is not True:
-                    QMessageBox.warning(
-                        self, "需要遠端控制模式",
-                        "控制器回報的遠端控制狀態不是 true。\n\n"
-                        "請先在 PolyScope 進入遠端模式（設定 → 系統 → 遠端控制），"
-                        "再重新啟動控制。")
-                    self.log("已封鎖啟動：控制器不在遠端控制模式")
-                    return
-                if not self._confirm_real_robot_checklist():
-                    return
-            if not self._workspace_is_configured():
-                QMessageBox.warning(
-                    self,
-                    "需要設定工作區邊界",
-                    "虛擬工作區 XYZ 邊界尚未設定，實際移動已被鎖定。"
-                    "請先在 ur10_vision_qt_app.py 設定經審核的基座座標範圍。",
-                )
-                self.status_banner.setText("工作區未設定 | 控制鎖定")
-                self.log("已封鎖實際控制：虛擬工作區未設定")
-                return
-            if not self._workspace_feedback_is_fresh():
-                QMessageBox.warning(
-                    self,
-                    "TCP 姿態不可用",
-                    "在收到新的 RTDE TCP 姿態回饋之前，實際移動會維持鎖定。",
-                )
-                self.status_banner.setText("姿態回饋中斷 | 控制鎖定")
-                self.log("已封鎖實際控制：TCP 姿態回饋不可用")
-                return
-            if self.workspace_fault:
-                pose = self.rtde_client.actual_tcp_pose
-                if pose is None or not self._workspace_contains_pose(pose):
-                    QMessageBox.warning(
-                        self,
-                        "工作區故障未解除",
-                        "TCP 目前在工作區之外。請先將 TCP 移回設定範圍內，再重新啟動控制。",
-                    )
-                    return
-                self.workspace_fault = False
-                self.workspace_fault_reason = ""
-                self.log("TCP 已回到工作區內；已手動解除工作區故障")
-            self.robot_enabled = True
-            self._set_speed_editor_enabled(False)
-            self.enable_button.setText("停止機械人控制")
-            self.status_banner.setText("實際控制已啟動")
-            self.log("機械人控制已啟動")
-        else:
-            self.emergency_stop()
-        self._update_status()
-
-    def emergency_stop(self) -> None:
-        self.robot_enabled = False
-        self._set_speed_editor_enabled(True)
-        self.test_timer.stop()
-        self.return_timer.stop()
-        self.returning_to_origin = False
-        self._send_stop()
-        self.enable_button.setText("啟動機械人控制")
-        self.status_banner.setText("已停止 | 控制關閉")
-        self.log("已送出停止指令")
-        self._update_status()
-
-    def _send_stop(self) -> None:
-        if self.robot is not None:
-            try:
-                self.robot.speedStop(2.0)
-            except Exception:
-                pass
-
-    def test_ursim_motion(self) -> None:
-        if (self.session_identity is None
-                or self.session_identity[0] != URSIM_TARGET
-                or self.rtde_client is None
-                or not self.rtde_client.connected
-                or not self.robot_enabled):
-            QMessageBox.warning(self, "控制未啟動", "請先連接 URSim 並啟動控制。")
-            return
-        self.test_vector = (0.02, 0.0, 0.0)
-        self.test_steps = 10
-        self.test_timer.start(100)
-        self.status_banner.setText("URSim 測試移動中")
-        self.log("URSim 測試開始")
-
-    def axis_test(self, dx: float, dy: float, dz: float) -> None:
-        if (self.session_identity is None
-                or self.rtde_client is None
-                or not self.rtde_client.connected
-                or not self.robot_enabled):
-            QMessageBox.warning(
-                self, "Control disabled",
-                "Connect the robot and enable control before axis tests.")
-            return
-        if self.session_identity[0] != URSIM_TARGET:
-            QMessageBox.warning(self, "實體機械人不可測試", "實體機械人不會自動測試或返回。")
-            return
-        speed = min(self._value("Max speed"), self.SAFETY_SPEED_CAP)
-        self.test_vector = tuple(axis * speed for axis in (dx, dy, dz))
-        self.test_steps = int(math.ceil(self.AXIS_TEST_DISTANCE / (speed * self.CONTROL_PERIOD)))
-        self.test_timer.start(int(self.CONTROL_PERIOD * 1000))
-        self.status_banner.setText("單軸測試移動中")
-        self.log(f"單軸測試 {dx:+d}X {dy:+d}Y {dz:+d}Z："
-                 f"{self.AXIS_TEST_DISTANCE * 100:.0f} cm @ {speed:.3f} m/s")
-
-    def _test_step(self) -> None:
-        if self.test_steps <= 0 or not self.robot_enabled or self.robot is None:
-            self.test_timer.stop()
-            self._send_stop()
-            self.status_banner.setText("測試完成 | 已停止")
-            return
-        try:
-            if not self._send_velocity(*self.test_vector):
-                self.test_timer.stop()
-                return
-            self.test_steps -= 1
-        except Exception as exc:
-            self.test_timer.stop()
-            self.log(f"測試移動失敗: {exc}")
-            # ur-rtde may have a native reconnect worker after EOF. Disable
-            # motion first and leave cleanup to an explicit Disconnect/Close.
-            self.robot_enabled = False
-            self.enable_button.setText("啟動機械人控制")
-            self.status_banner.setText("RTDE 中斷 | 控制關閉")
 
     # --- Camera / vision ----------------------------------------------
 
@@ -1299,103 +485,93 @@ class UR10VisionQtApp(QMainWindow):
         else:
             self.start_camera()
 
-    def _camera_source_changed(self, text: str) -> None:
-        self.camera_source.setVisible(text == "<Manual entry>")
+    def _camera_source_changed(self, _text):
+        self.camera_source.setVisible(self.camera_combo.currentData() == MANUAL_CAMERA)
 
-    def _scan_cameras(self) -> None:
+    def _scan_cameras(self):
+        if self.scanner is not None:
+            return
+        if self.camera_running or self.robot_enabled:
+            QMessageBox.warning(self, "請先停止", "掃描前請關閉相機及機械人控制。")
+            return
+        self.scanner = CameraScanner()
+        self.camera_button.setEnabled(False)
         self.scan_button.setEnabled(False)
         self.scan_button.setText("掃描中…")
-        QApplication.processEvents()
-        found = []
-        for index in range(10):
-            cap = cv2.VideoCapture(index)
-            if cap.isOpened():
-                ok, _ = cap.read()
-                if ok:
-                    found.append(str(index))
-            cap.release()
-        current_items = [self.camera_combo.itemText(i) for i in range(self.camera_combo.count())]
-        for item in found:
-            if item not in current_items:
-                self.camera_combo.addItem(item)
-        if found:
-            self.camera_combo.setCurrentText(found[0])
-            self.log(f"找到相機: {', '.join(found)}")
-        else:
-            self.log("找不到相機")
-        self.scan_button.setEnabled(True)
-        self.scan_button.setText("掃描相機")
 
     def _camera_value(self):
-        text = self.camera_combo.currentText().strip()
-        if text == "<Manual entry>" or not text:
-            source = self.camera_source.text().strip()
-        else:
-            source = text
+        value = self.camera_combo.currentData()
+        source = self.camera_source.text().strip() if value == MANUAL_CAMERA else str(value)
+        if not source:
+            raise ValueError('請輸入相機索引或 RTSP URL')
         try:
             return int(source)
         except ValueError:
             return source
 
-    def start_camera(self) -> None:
-        if self.hands is None:
-            try:
-                self.hands = self.mp_hands.Hands(
-                    max_num_hands=1,
-                    min_detection_confidence=self._value("Detection"),
-                    min_tracking_confidence=self._value("Tracking"),
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, "視覺模型錯誤", str(exc))
-                return
-        cap = cv2.VideoCapture(self._camera_value())
-        if not cap.isOpened():
-            cap.release()
-            QMessageBox.warning(self, "相機錯誤", "無法開啟相機或 RTSP 串流。")
+    def start_camera(self):
+        if self.vision is not None:
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap = cap
+        if self.scanner is not None:
+            QMessageBox.warning(self, '掃描中', '請等待相機掃描完成後再開啟相機。')
+            return
+        self._set_mode(Mode.DISABLED)
+        try:
+            self.vision = VisionClient(self._camera_value(), self._value('Detection'),
+                                       self._value('Tracking'), self.camera_state)
+        except Exception as exc:
+            QMessageBox.warning(self, '相機錯誤', str(exc))
+            return
         self.camera_running = True
-        self.smooth_x = self.smooth_y = self.smooth_size = self.neutral_hand_size = None
-        self.neutral_x = self.neutral_y = None
+        self.frame_acquired_at = 0.0
+        self.smooth_x = self.smooth_y = self.smooth_size = None
+        self.neutral_x = self.neutral_y = self.neutral_hand_size = None
         self.calibration_active = False
+        self._stabilize_command('STOP')
         self.neutral_samples = 0
         self.neutral_x_sum = self.neutral_y_sum = self.neutral_size_sum = 0.0
         self.lost_hand_frames = 0
-        self.last_fps_time = time.monotonic()
+        self.last_fps_time = monotonic()
         self.fps_frames = 0
-        self.camera_button.setText("關閉相機")
+        self.camera_combo.setEnabled(False)
+        self.camera_source.setEnabled(False)
+        self.camera_button.setText('關閉相機')
+        self.scan_button.setEnabled(False)
         self.calibrate_button.setEnabled(True)
         self.depth_button.setEnabled(True)
         self.frame_timer.start(25)
-        self.status_banner.setText("相機運行中 | 模擬模式")
-        self.log("相機已開啟；張開手掌置中即可校準")
+        self.status_banner.setText('相機啟動中 | 控制關閉')
+        self.log('相機 worker 已啟動；影像出現後請按「校準中立姿態」')
 
-    def stop_camera(self) -> None:
+    def stop_camera(self):
+        self._set_mode(Mode.DISABLED)
         self.camera_running = False
         self.frame_timer.stop()
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
-        self._send_stop()
-        self.camera_button.setText("開啟相機")
+        if self.vision is not None:
+            self.vision.close()
+            self.vision = None
+        self.camera_combo.setEnabled(True)
+        self.camera_source.setEnabled(True)
+        self.camera_button.setText('開啟相機')
+        self.scan_button.setEnabled(self.scanner is None)
         self.calibrate_button.setEnabled(False)
         self.depth_button.setEnabled(False)
         self.video_label.clear()
-        self.video_label.setText("相機未開啟")
-        self.status_banner.setText("就緒 | 模擬模式")
+        self.video_label.setText('相機未開啟')
+        self.status_banner.setText('相機已關閉 | 控制關閉')
         self._update_status()
-        self.log("相機已關閉")
+        self.log('相機已關閉，控制已停用')
 
     def start_calibration(self) -> None:
+        self._set_mode(Mode.DISABLED)
+        self._stabilize_command("STOP")
         self.neutral_x = self.neutral_y = self.neutral_hand_size = None
         self.neutral_samples = 0
         self.neutral_x_sum = self.neutral_y_sum = self.neutral_size_sum = 0.0
         self.calibration_active = True
         self.status_banner.setText("校準中 | 請保持張開手掌不動")
         self.log("手動中立校準開始")
+        self._update_status()
 
     def toggle_zones(self) -> None:
         self.show_zones = not self.show_zones
@@ -1404,6 +580,7 @@ class UR10VisionQtApp(QMainWindow):
         self.log(f"分區顯示已{label}")
 
     def toggle_depth_direction(self) -> None:
+        self._set_mode(Mode.DISABLED)
         self.depth_inverted = not self.depth_inverted
         label = "反轉" if self.depth_inverted else "正常"
         self.depth_button.setText(f"深度方向：{label}")
@@ -1411,6 +588,7 @@ class UR10VisionQtApp(QMainWindow):
         self._save_settings()
 
     def toggle_direction_invert(self) -> None:
+        self._set_mode(Mode.DISABLED)
         self.direction_inverted = not self.direction_inverted
         label = "反轉" if self.direction_inverted else "正常"
         self.invert_button.setText(f"移動方向：{label}")
@@ -1457,61 +635,21 @@ class UR10VisionQtApp(QMainWindow):
             self.smooth_y += alpha * (y - self.smooth_y)
         return self.smooth_x, self.smooth_y
 
-    @staticmethod
-    def _axis_from_center(value: float, dead_zone: float, center: float = 0.5) -> float:
-        """Return zero inside the centre zone, then scale the remainder."""
-        offset = value - center
-        magnitude = abs(offset)
-        if magnitude <= dead_zone + 1e-6:
-            return 0.0
-        usable = max(0.001, min(center, 1.0 - center) - dead_zone)
-        return math.copysign(min(0.5, (magnitude - dead_zone) / usable * 0.5), offset)
 
     @staticmethod
     def _command_name(vx: float, vy: float, vz: float) -> str:
         parts = []
-        if vx < -0.0005: parts.append("LEFT")
-        elif vx > 0.0005: parts.append("RIGHT")
-        if vz > 0.0005: parts.append("UP")
-        elif vz < -0.0005: parts.append("DOWN")
-        if vy > 0.0005: parts.append("FWD")
-        elif vy < -0.0005: parts.append("BACK")
+        if vx < -1e-9: parts.append("LEFT")
+        elif vx > 1e-9: parts.append("RIGHT")
+        if vz > 1e-9: parts.append("UP")
+        elif vz < -1e-9: parts.append("DOWN")
+        if vy > 1e-9: parts.append("FWD")
+        elif vy < -1e-9: parts.append("BACK")
         return "+".join(parts) if parts else "STOP"
 
-    def _zone_command(self, x: float, y: float, size: float, confidence: float,
-                      speed: float) -> tuple[float, float, float, str]:
-        """Conservative mutually-exclusive zones: left, centre-depth, right."""
-        if confidence < self.CONFIDENCE_GATE or self.neutral_x is None or self.neutral_y is None:
-            return 0.0, 0.0, 0.0, "STOP"
-
-        # X is intentionally zone-based, not continuous: this prevents a
-        # slightly noisy landmark from commanding left/right unexpectedly.
-        if x < self.LEFT_ZONE_END:
-            vx = -speed
-            return vx, 0.0, 0.0, "LEFT"
-        if x > self.RIGHT_ZONE_START:
-            vx = speed
-            return vx, 0.0, 0.0, "RIGHT"
-
-        # Centre column: depth (FWD/BACK) is checked first because moving
-        # the hand toward the camera naturally causes the palm centre to
-        # drift downward in the image. If UP/DOWN were checked first, a
-        # forward push would be misread as DOWN before depth is evaluated.
-        relative_depth = (size - self.neutral_hand_size) / self.neutral_hand_size
-        if abs(relative_depth) > self.DEPTH_RATIO_DEAD_ZONE:
-            vy = max(-speed, min(speed, relative_depth * self._value("Size sensitivity") * speed))
-            if self.depth_inverted:
-                vy = -vy
-            return 0.0, vy, 0.0, "FWD" if vy > 0 else "BACK"
-
-        # Palm size unchanged: only then check vertical UP/DOWN.
-        vertical_offset = y - self.neutral_y
-        if vertical_offset < -self.VERTICAL_ZONE_DEAD:
-            return 0.0, 0.0, speed, "UP"
-        if vertical_offset > self.VERTICAL_ZONE_DEAD:
-            return 0.0, 0.0, -speed, "DOWN"
-
-        return 0.0, 0.0, 0.0, "STOP"
+    def _zone_command(self, x, y, size, confidence, speed):
+        return zone_command(x, y, size, self.neutral_x, self.neutral_y, self.neutral_hand_size,
+                            speed, self._value('Dead zone'), self._value('Size sensitivity'), self.depth_inverted)
 
     def _stabilize_command(self, command: str) -> str:
         if command == "STOP":
@@ -1524,230 +662,47 @@ class UR10VisionQtApp(QMainWindow):
         else:
             self.pending_command = command
             self.pending_command_frames = 1
+            self.stable_command = "STOP"
         if self.pending_command_frames >= self.COMMAND_CONFIRM_FRAMES:
             self.stable_command = command
         return self.stable_command
 
-    def _workspace_limits(self) -> tuple[Optional[float], ...]:
-        return self._workspace_profile.limits
 
-    def _workspace_is_configured(self) -> bool:
-        return workspace_is_configured(self._workspace_limits())
-
-    def _workspace_summary(self) -> str:
-        if not self._workspace_is_configured():
-            return "虛擬工作區未設定；實際移動維持封鎖"
-        limits = self._workspace_limits()
-        return (
-            "虛擬工作區（基座座標 m）： "
-            f"X={limits[0]:.3f}..{limits[1]:.3f}, "
-            f"Y={limits[2]:.3f}..{limits[3]:.3f}, "
-            f"Z={limits[4]:.3f}..{limits[5]:.3f}"
-        )
-
-    def _workspace_feedback_is_fresh(self) -> bool:
-        return bool(
-            self.rtde_client
-            and self.rtde_client.actual_tcp_pose is not None
-            and time.monotonic() - self.rtde_client.pose_received_at <= self.POSE_FEEDBACK_TIMEOUT
-        )
-
-    def _workspace_safety_status_is_acceptable(self) -> bool:
-        # UR safety modes: 1=NORMAL and 2=REDUCED are the only motion-permitting modes.
-        return bool(self.rtde_client and self.rtde_client.safety_status in (1, 2))
-
-    def _trip_workspace_fault(self, reason: str) -> None:
-        if self.workspace_fault:
+    def update_frame(self):
+        if self.vision is None:
             return
-        self.workspace_fault = True
-        self.workspace_fault_reason = reason
-        self.robot_enabled = False
-        self._set_speed_editor_enabled(True)
-        self.test_timer.stop()
-        self._send_stop()
-        self.enable_button.setText("啟動機械人控制")
-        self.status_banner.setText(f"工作區故障 | {reason}")
-        self.log(f"工作區故障：{reason}")
-        self._update_status()
-
-    def _workspace_contains_pose(self, pose: tuple[float, ...]) -> bool:
-        if not self._workspace_is_configured():
-            return False
-        limits = self._workspace_limits()
-        workspace_pairs = ((limits[0], limits[1]), (limits[2], limits[3]),
-                           (limits[4], limits[5]))
-        return all(
-            minimum is not None and maximum is not None
-            and minimum - self.WALL_TOLERANCE <= coordinate <= maximum + self.WALL_TOLERANCE
-            for coordinate, (minimum, maximum) in zip(pose[:3], workspace_pairs)
-        )
-
-    def _apply_workspace_wall(self, vx: float, vy: float, vz: float) -> Optional[tuple[float, float, float]]:
-        if not self._workspace_is_configured():
-            self._trip_workspace_fault("工作區未設定")
-            return None
-        if not self._workspace_feedback_is_fresh():
-            self._trip_workspace_fault("TCP 姿態回饋中斷")
-            return None
-        if not self._workspace_safety_status_is_acceptable():
-            status = self.rtde_client.safety_status if self.rtde_client else None
-            self._trip_workspace_fault(f"機械人安全模式 {SAFETY_MODE_ZH.get(status, status)}")
-            return None
-        pose = self.rtde_client.actual_tcp_pose
-        assert pose is not None
-        coordinates = pose[:3]
-        limits = self._workspace_limits()
-        workspace_pairs = ((limits[0], limits[1]), (limits[2], limits[3]),
-                           (limits[4], limits[5]))
-        velocities = [vx, vy, vz]
-        names = ("X", "Y", "Z")
-        for index, (coordinate, (minimum, maximum)) in enumerate(zip(coordinates, workspace_pairs)):
-            assert minimum is not None and maximum is not None
-            if coordinate < minimum - self.WALL_TOLERANCE or coordinate > maximum + self.WALL_TOLERANCE:
-                self._trip_workspace_fault(
-                    f"TCP {names[index]}={coordinate:.3f} m 超出 {minimum:.3f}..{maximum:.3f} m"
-                )
-                return None
-            if coordinate <= minimum + self.WALL_TOLERANCE and velocities[index] < 0:
-                velocities[index] = 0.0
-                self._start_return_to_origin()
-            elif coordinate >= maximum - self.WALL_TOLERANCE and velocities[index] > 0:
-                velocities[index] = 0.0
-                self._start_return_to_origin()
-            else:
-                # Linear slowdown inside the band before the wall: full speed
-                # at WALL_SLOW_ZONE distance, WALL_MIN_SCALE at the wall.
-                distance_to_wall = (coordinate - minimum if velocities[index] < 0
-                                    else maximum - coordinate)
-                if 0.0 < distance_to_wall < self.WALL_SLOW_ZONE:
-                    scale = max(self.WALL_MIN_SCALE,
-                                distance_to_wall / self.WALL_SLOW_ZONE)
-                    velocities[index] *= scale
-        return tuple(velocities)
-
-    def _start_return_to_origin(self) -> None:
-        if self.returning_to_origin:
-            return
-        if self.session_identity is None or self.session_identity[0] != URSIM_TARGET:
-            self._trip_workspace_fault("撞牆；實體機械人停用自動返回")
-            return
-        safe_origin = self._workspace_profile.safe_origin
-        if safe_origin is None or not self._workspace_is_configured() or not self._workspace_contains_pose(safe_origin):
-            self._trip_workspace_fault("撞牆；安全原點不在工作區內")
-            return
-        if not self._workspace_feedback_is_fresh() or not self._workspace_safety_status_is_acceptable():
-            self._trip_workspace_fault("撞牆；姿態或安全回饋不可用")
-            return
-        self._send_stop()
-        self.returning_to_origin = True
-        self.return_started_at = time.monotonic()
-        self.status_banner.setText("返回安全原點中 | URSim")
-        self.log("撞到空氣牆；以低速直線返回安全原點")
-        self.return_timer.start()
-
-    def _return_step(self) -> None:
-        if not self.returning_to_origin:
-            self.return_timer.stop()
-            return
-        if (time.monotonic() - self.return_started_at > self.RETURN_TIMEOUT
-                or self.rtde_client is None
-                or not self.rtde_client.connected
-                or self.session_identity is None
-                or self.session_identity[0] != URSIM_TARGET
-                or not self._workspace_feedback_is_fresh()
-                or not self._workspace_safety_status_is_acceptable()):
-            self.return_timer.stop()
-            self.returning_to_origin = False
-            self._trip_workspace_fault("返回安全原點被中止")
-            return
-        pose = self.rtde_client.actual_tcp_pose
-        safe_origin = self._workspace_profile.safe_origin
-        if pose is None or safe_origin is None or not self._workspace_contains_pose(pose):
-            self.return_timer.stop()
-            self.returning_to_origin = False
-            self._trip_workspace_fault("返回安全原點時離開工作區")
-            return
-        delta = [safe_origin[i] - pose[i] for i in range(3)]
-        distance = math.sqrt(sum(value * value for value in delta))
-        if distance <= self.RETURN_POSITION_TOLERANCE:
-            self.return_timer.stop()
-            self.returning_to_origin = False
-            self._send_stop()
-            self.robot_enabled = False
-            self.status_banner.setText("已返回原點 | 控制關閉")
-            self.log("已返回安全原點；控制維持關閉")
-            self._update_status()
-            return
-        scale = min(self.RETURN_SPEED_CAP / distance, 1.0)
-        self._send_velocity(delta[0] * scale, delta[1] * scale, delta[2] * scale)
-
-    def _send_velocity(self, vx: float, vy: float, vz: float) -> bool:
-        if (self.session_identity is None
-                or not self.robot_enabled
-                or self.rtde_client is None
-                or not self.rtde_client.connected):
-            return False
-        if self.returning_to_origin and self.session_identity[0] != URSIM_TARGET:
-            return False
-        guarded_velocity = self._apply_workspace_wall(vx, vy, vz)
-        if guarded_velocity is None:
-            return False
-        safe_vector = cap_translational_velocity([*guarded_velocity, 0.0, 0.0, 0.0])
-        if safe_vector is None:
-            self._trip_workspace_fault("速度向量無效或超過 0.5 m/s")
-            return False
-        vx, vy, vz = safe_vector[:3]
-        now = time.monotonic()
-        if now - self.last_robot_update < self.CONTROL_PERIOD:
-            return True
-        try:
-            if max(abs(vx), abs(vy), abs(vz)) < 0.0005:
-                self.robot.speedStop(2.0)
-            else:
-                self.robot.speedL([vx, vy, vz, 0.0, 0.0, 0.0], self.ACCELERATION, self.CONTROL_PERIOD)
-        except Exception as exc:
-            self.log(f"RTDE 控制錯誤: {exc}")
-            self.robot_enabled = False
-            self.rtde_lost = True
-            self.enable_button.setText("啟動機械人控制")
-            self.status_banner.setText("RTDE 中斷 | 控制關閉")
-            return False
-        self.last_robot_update = now
-        return True
-
-    def update_frame(self) -> None:
-        if self.cap is None or self.hands is None:
-            return
-        ok, frame = self.cap.read()
-        if not ok:
-            self.camera_failures += 1
-            if self.camera_failures >= 20:
+        sample = self.vision.poll()
+        now = monotonic()
+        if sample is None:
+            if self.frame_acquired_at and not fresh(now, self.frame_acquired_at, FRAME_TIMEOUT):
+                if self.mode == Mode.GESTURE:
+                    self._trip_workspace_fault('影像回饋過期')
+            elif not self.frame_acquired_at and now - self.vision.started > 15:
                 self.stop_camera()
-                self.status_banner.setText("相機連續讀取失敗，已關閉")
+                self.status_banner.setText('相機啟動逾時 | 控制關閉')
             return
-        self.camera_failures = 0
-        now = time.monotonic()
-        if now - self.last_frame_time < 1 / 15:
+        if sample[0] == 'error':
+            self.stop_camera()
+            self.status_banner.setText(sample[1])
+            self.log(sample[1])
             return
-        self.last_frame_time = now
+        _, acquired_at, frame, points, confidence, quality_ok = sample
+        if not fresh(now, acquired_at, FRAME_TIMEOUT):
+            if self.mode == Mode.GESTURE:
+                self._trip_workspace_fault('影像處理結果過期')
+            return
+        self.frame_acquired_at = acquired_at
         self.fps_frames += 1
         if now - self.last_fps_time >= 1:
             self.current_fps = self.fps_frames / (now - self.last_fps_time)
             self.fps_frames, self.last_fps_time = 0, now
-
-        frame = cv2.flip(frame, 1)
-        result = self.hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        hand = SimpleNamespace(landmark=[SimpleNamespace(x=x, y=y, z=z) for x,y,z in points])
         vx = vy = vz = 0.0
-        confidence = 0.0
         hand_display = "-, - | --"
         valid = False
 
-        if result.multi_hand_landmarks:
-            hand = result.multi_hand_landmarks[0]
-            if result.multi_handedness:
-                confidence = result.multi_handedness[0].classification[0].score
-            self.mp_draw.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
-            if self._hand_valid(hand):
+        if points:
+            if quality_ok and self._hand_valid(hand):
                 valid = True
                 self.lost_hand_frames = 0
                 palm = (0, 5, 9, 13, 17)
@@ -1762,6 +717,12 @@ class UR10VisionQtApp(QMainWindow):
                     # user's centre. This prevents the first noisy landmark
                     # frame from becoming a permanent movement offset.
                     if self.calibration_active and (self.neutral_x is None or self.neutral_y is None):
+                        if self.neutral_samples:
+                            n = self.neutral_samples
+                            if (math.hypot(x - self.neutral_x_sum/n, y - self.neutral_y_sum/n) > .03
+                                    or abs(size - self.neutral_size_sum/n) > .10 * self.neutral_size_sum/n):
+                                self.neutral_samples = 0
+                                self.neutral_x_sum = self.neutral_y_sum = self.neutral_size_sum = 0.0
                         self.neutral_samples += 1
                         self.neutral_x_sum += x
                         self.neutral_y_sum += y
@@ -1787,6 +748,11 @@ class UR10VisionQtApp(QMainWindow):
                             vx = vy = vz = 0.0
                         elif self.direction_inverted:
                             vx, vy, vz = -vx, -vy, -vz
+                else:
+                    self._stabilize_command("STOP")
+                    if self.calibration_active:
+                        self.neutral_samples = 0
+                        self.neutral_x_sum = self.neutral_y_sum = self.neutral_size_sum = 0.0
                 if self.neutral_hand_size:
                     delta = (size - self.neutral_hand_size) / self.neutral_hand_size * 100
                     hand_display = f"{x:.2f}, {y:.2f} | {delta:+.0f}%"
@@ -1796,40 +762,47 @@ class UR10VisionQtApp(QMainWindow):
                 hand_display = "已偵測 | 請靠近並張開手掌"
 
         if not valid:
+            if self.calibration_active:
+                self.neutral_samples = 0
+                self.neutral_x_sum = self.neutral_y_sum = self.neutral_size_sum = 0.0
             self.lost_hand_frames += 1
             if self.lost_hand_frames > self.LOST_HAND_GRACE:
                 self.smooth_x = self.smooth_y = self.smooth_size = None
 
         command = locals().get("command", "STOP")
-        if not valid or confidence < self.CONFIDENCE_GATE:
+        if not valid:
             command = self._stabilize_command("STOP")
             vx = vy = vz = 0.0
-        self._send_velocity(vx, vy, vz)
+        command = self._command_name(vx, vy, vz)
+        if self.mode == Mode.GESTURE:
+            self._send_velocity(vx, vy, vz, source=Mode.GESTURE)
+        self._last_hand_display, self._last_handedness = hand_display, confidence
         self._update_status(command, hand_display, confidence)
         self._draw_overlay(frame, command, confidence)
         if self.robot_enabled or command != self._last_frame_command:
             size_delta = None
             if self.neutral_hand_size:
                 size_delta = (size - self.neutral_hand_size) / self.neutral_hand_size * 100 if valid else None
-            self._csv_row("frame", command=command, vx=vx, vy=vy, vz=vz,
+            self._csv_row("vision_request", command=command, vx=vx, vy=vy, vz=vz,
                           hand_x=x if valid else None, hand_y=y if valid else None,
                           size_delta_pct=size_delta, confidence=confidence)
             self._last_frame_command = command
-            if self.robot_enabled and int(time.monotonic()) != getattr(self, "_csv_flush_tick", 0):
-                self._csv_flush_tick = int(time.monotonic())
+            if self.robot_enabled and int(monotonic()) != getattr(self, "_csv_flush_tick", 0):
+                self._csv_flush_tick = int(monotonic())
                 self._flush_csv()
         self._show_frame(frame)
 
     def _draw_overlay(self, frame, command: str, confidence: float) -> None:
         h, w = frame.shape[:2]
         if self.show_zones:
-            left_x = int(w * self.LEFT_ZONE_END)
-            right_x = int(w * self.RIGHT_ZONE_START)
+            center = self.neutral_x if self.neutral_x is not None else .5
+            left_x = int(w * (center - self._value("Dead zone")))
+            right_x = int(w * (center + self._value("Dead zone")))
             cv2.line(frame, (left_x, 0), (left_x, h), (255, 180, 0), 2)
             cv2.line(frame, (right_x, 0), (right_x, h), (255, 180, 0), 2)
             if self.neutral_y is not None:
-                top_y = int(h * (self.neutral_y - self.VERTICAL_ZONE_DEAD))
-                bottom_y = int(h * (self.neutral_y + self.VERTICAL_ZONE_DEAD))
+                top_y = int(h * (self.neutral_y - self._value("Dead zone")))
+                bottom_y = int(h * (self.neutral_y + self._value("Dead zone")))
                 cv2.line(frame, (left_x, top_y), (right_x, top_y), (255, 180, 0), 2)
                 cv2.line(frame, (left_x, bottom_y), (right_x, bottom_y), (255, 180, 0), 2)
             cv2.putText(frame, "LEFT", (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
@@ -1841,7 +814,7 @@ class UR10VisionQtApp(QMainWindow):
         color = (0, 200, 0) if command != "STOP" else (0, 0, 220)
         cv2.putText(frame, f"{command} | {'LIVE' if self.robot_enabled else 'SIMULATION'}", (18, 36),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
-        cv2.putText(frame, f"Confidence: {confidence * 100:.0f}%  FPS: {self.current_fps:.0f}", (18, 66),
+        cv2.putText(frame, f"Handedness: {confidence * 100:.0f}%  FPS: {self.current_fps:.0f}", (18, 66),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (225, 225, 225), 1)
         size_text = f"Size neutral: {self.neutral_hand_size:.3f}" if self.neutral_hand_size else "Centre hand to calibrate size"
         cv2.putText(frame, size_text, (18, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 220), 1)
@@ -1853,25 +826,45 @@ class UR10VisionQtApp(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         self.video_label.setPixmap(pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-    def closeEvent(self, event) -> None:
-        self.frame_timer.stop()
-        self.test_timer.stop()
-        self._send_stop()
+    def closeEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
+        self.stop_camera()
         self._disconnect_robot()
-        if self.cap is not None:
-            self.cap.release()
-        if self.hands is not None:
-            self.hands.close()
+        self.rtde_timer.stop()
+        if self.scanner is not None:
+            self.scanner.close()
         self._save_settings()
         self._flush_csv()
         if self.csv_file is not None:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
-            self.csv_file = None
-            self.csv_writer = None
+            self.csv_file.close()
+            self.csv_file = self.csv_writer = None
         event.accept()
+
+
+    def _poll_scanner(self):
+        if self.scanner is None:
+            return
+        found = self.scanner.poll()
+        if found is None:
+            return
+        self.scanner.close()
+        self.scanner = None
+        for source in found:
+            if self.camera_combo.findData(source) < 0:
+                self.camera_combo.addItem(source, source)
+        self.scan_button.setEnabled(True)
+        self.camera_button.setEnabled(True)
+        self.scan_button.setText('掃描')
+        self.log('找到相機：' + ', '.join(found) if found else '未找到相機或掃描逾時')
+
+    def apply_vision_settings(self):
+        running = self.camera_running
+        if running:
+            self.stop_camera()
+        self._save_settings()
+        if running:
+            self.start_camera()
+        self.log('偵測／追蹤設定已套用；開啟相機後須重新校準及啟動控制')
 
 
 def main() -> int:

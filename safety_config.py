@@ -59,9 +59,25 @@ def workspace_profile(target: str) -> WorkspaceProfile:
 
 
 def workspace_is_configured(limits: Sequence[Optional[float]]) -> bool:
-    if len(limits) != 6 or any(value is None or not math.isfinite(float(value)) for value in limits):
-        return False
-    return all(float(lower) < float(upper) for lower, upper in zip(limits[::2], limits[1::2]))
+    return not workspace_errors(limits)
+
+
+def workspace_errors(limits: Sequence[Optional[float]]) -> list[str]:
+    """Describe invalid installation data without guessing replacement bounds."""
+    if len(limits) != 6:
+        return ["工作區需要六個 XYZ 上下限"]
+    errors = []
+    for axis, lower, upper in zip("XYZ", limits[::2], limits[1::2]):
+        try:
+            if lower is None or upper is None:
+                errors.append(f"{axis} 上下限未設定")
+            elif not all(math.isfinite(float(v)) for v in (lower, upper)):
+                errors.append(f"{axis} 上下限必須為有限數值")
+            elif float(lower) >= float(upper):
+                errors.append(f"{axis} 下限 {lower} 必須小於上限 {upper}")
+        except (ValueError, TypeError, OverflowError):
+            errors.append(f"{axis} 上下限必須為數值")
+    return errors
 
 
 def speed_for_profile(target: str, saved_value: object = None) -> float:

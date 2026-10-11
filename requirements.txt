@@ -1,7 +1,6 @@
 opencv-contrib-python==4.11.0.86
 numpy==1.26.4
-Pillow
+Pillow==11.3.0
 mediapipe==0.10.21
-ur-rtde
-
-PySide6
+ur-rtde==1.6.5
+PySide6==6.10.3

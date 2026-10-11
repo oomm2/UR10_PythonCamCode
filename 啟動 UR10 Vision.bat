@@ -15,11 +15,11 @@ if not exist "%VENV%" (
     echo [SETUP] 正在建立 Python 虛擬環境...
     where py >nul 2>nul
     if not errorlevel 1 (
-        py -3 -m venv .venv
+        py -3.11 -m venv .venv
     ) else (
         where python >nul 2>nul
         if errorlevel 1 (
-            echo [ERROR] 找不到 Python 3。請先安裝 Python 3.9 或更新版本。
+            echo [ERROR] 找不到 Python 3。請先安裝 Python 3.11。
             pause
             exit /b 1
         )
@@ -32,14 +32,11 @@ if not exist "%VENV%" (
     )
 )
 
-if not exist ".venv\requirements-installed" (
-    echo [SETUP] 正在安裝 requirements.txt，首次啟動可能需要幾分鐘...
-    "%VENV%" -m pip install --upgrade pip
-    if errorlevel 1 goto :install_failed
-    "%VENV%" -m pip install -r requirements.txt
-    if errorlevel 1 goto :install_failed
-    type nul > ".venv\requirements-installed"
-)
+rem Always resolve the pinned requirements. Existing matching packages are reused.
+rem Do not use a stale marker that misses requirements.txt updates.
+echo [SETUP] 正在核對套件版本...
+"%VENV%" -m pip install -r requirements.txt
+if errorlevel 1 goto :install_failed
 
 echo 正在啟動 UR10 Vision Control...
 "%VENV%" "%APP%"

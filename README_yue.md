@@ -2,7 +2,7 @@
 
 [English](README.md) ｜ [廣東話](README_yue.md)
 
-**文件同步日期：2026-09-23**
+**文件同步日期：2026-10-12**
 
 呢個係一個重視私隱嘅 Final Year Project（FYP）套件，適用於 Universal Robots UR10 / URSim。佢有兩個刻意分開嘅 modules：
 
@@ -36,19 +36,19 @@ Controller 先會負責出 command；monitor 只會讀 RTDE output telemetry。M
 
 ### 功能
 
-- PySide6 dashboard，有 camera preview 同單手 MediaPipe tracking
-- 中立姿態校準、信心值過濾、平滑化同方向手勢分區
-- RTDE control 路徑會喺獨立 worker process 運行，避免 native connection failure 令 Qt UI 一齊出事
+- PySide6 dashboard，有 camera preview、校準進度，同可切換嘅深色／淺色模式
+- 中立姿態校準、landmark 質素同時效檢查、平滑化同方向手勢分區
+- 影像處理同 RTDE 控制各自喺獨立 process 運行；指令及回饋有逾時檢查，STOP 優先處理
 - URSim 專用示範工作空間同保守速度預設
 - 實體 profile 預設冇 workspace limits，所以未喺本機量度同審核前，physical control 會保持鎖定
-- Safety-policy unit tests
+- 57 個離線測試，包括假 RTDE worker 同生成影片影像處理測試
 
 ### Camera-only 快速開始
 
 呢個 mode 唔需要機械人或者 network connection。
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -56,8 +56,10 @@ python ur10_vision_qt_app.py
 ```
 
 1. 撳 **開啟相機**；有需要就揀 camera source `0`。
-2. 張開手掌、保持唔郁，撳 **校準中立姿態**。
+2. 張開手掌、保持唔郁，撳預覽下方嘅 **校準姿態**。
 3. 睇畫面上嘅方向狀態，同時保持 robot control 關閉。
+
+右上角 **深色模式／淺色模式** 可以即時切換，選擇會儲存喺本機。每個分頁底部都睇到軟件 STOP。詳見 [離線驗證](docs/validation.md) 同 [深色介面預覽](docs/ui-preview-dark.png)。
 
 macOS 安裝 `ur-rtde` 時可能需要 Boost：
 

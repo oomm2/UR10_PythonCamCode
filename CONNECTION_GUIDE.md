@@ -17,6 +17,8 @@ docker run --rm -it \
 
 Open `http://localhost:6080/vnc.html` to use PolyScope. In the app, select **URSim**, use `127.0.0.1`, then click **連接機械人**. Motion remains disabled until you explicitly enable it.
 
+Prepare power, brakes, and the controller operating mode manually in PolyScope before requesting motion. The app does not power on or release the brakes through the Dashboard server.
+
 ## URSim in a virtual machine or another host
 
 Use a local, non-public setting such as `<URSIM_IP>` in your ignored `settings.json`:

@@ -2,7 +2,7 @@
 
 [English](README.md) ｜ [廣東話](README_yue.md)
 
-**Documentation synchronised: 2026-09-23**
+**Documentation synchronised: 2026-10-12**
 
 A privacy-conscious Final Year Project suite for Universal Robots UR10 / URSim. It combines two deliberately separate modules:
 
@@ -36,19 +36,19 @@ The supported controller application is `ur10_vision_qt_app.py`. `ur10_vision_ap
 
 ### Features
 
-- PySide6 dashboard with camera preview and single-hand MediaPipe tracking
-- Neutral-pose calibration, confidence filtering, smoothing, and directional gesture zones
-- Worker-process RTDE control path to isolate native connection failures from the UI
+- PySide6 dashboard with camera preview, calibration progress, and switchable light/dark themes
+- Neutral-pose calibration, landmark quality and freshness checks, smoothing, and directional gesture zones
+- Separate capture/inference and RTDE worker processes; independent command and feedback expiry, mandatory watchdog, and explicit STOP priority
 - URSim demonstration workspace profile and conservative speed defaults
 - Physical profile defaults to unset workspace limits, so physical control is locked until locally reviewed values exist
-- Safety-policy unit tests
+- 57 offline controller tests, including spawned fake RTDE and generated-video capture/inference checks
 
 ### Camera-only quick start
 
 No robot or network connection is required.
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -56,8 +56,10 @@ python ur10_vision_qt_app.py
 ```
 
 1. Click **開啟相機** and select camera source `0` if necessary.
-2. Hold an open palm steady and click **校準中立姿態**.
+2. Hold an open palm steady and click **校準姿態** below the preview.
 3. Observe the on-screen direction state while robot control stays disabled.
+
+Use the top-right **深色模式 / 淺色模式** button to change the theme; the choice is saved locally. The software STOP button remains visible at the bottom of every tab. See [offline validation](docs/validation.md) and the [dark UI preview](docs/ui-preview-dark.png).
 
 On macOS, `ur-rtde` may require Boost:
 

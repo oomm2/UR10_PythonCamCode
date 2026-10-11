@@ -1,3 +1,4 @@
+from vision_control.clock import monotonic
 import math
 import os
 import sys
@@ -18,6 +19,7 @@ from safety_config import (
     workspace_is_configured,
 )
 from ur10_vision_qt_app import UR10VisionQtApp
+from vision_control.policy import Mode
 
 
 class _Combo:
@@ -37,7 +39,7 @@ class _Slider:
 class _Robot:
     def __init__(self):
         self.sent = []
-    def speedL(self, vector, acceleration, period):
+    def speedL(self, vector, acceleration, period, **kwargs):
         self.sent.append((vector, acceleration, period))
     def speedStop(self, deceleration):
         self.sent.append(("stop", deceleration))
@@ -47,7 +49,7 @@ class _Client:
     connected = True
     safety_status = 1
     actual_tcp_pose = (0.0, 0.0, 0.5, 0.0, 0.0, 0.0)
-    pose_received_at = time.monotonic()
+    pose_received_at = monotonic()
 
 
 class SafetyPolicyTests(unittest.TestCase):
@@ -77,6 +79,9 @@ class SafetyPolicyTests(unittest.TestCase):
     def test_final_qt_dispatch_caps_norm_before_robot(self):
         app = UR10VisionQtApp.__new__(UR10VisionQtApp)
         app.returning_to_origin = False
+        app.mode = Mode.GESTURE
+        app.frame_acquired_at = monotonic()
+        app._value = lambda name: 0.5
         app.session_identity = (URSIM_TARGET, "sim", 1)
         app.robot_enabled = True
         app.rtde_client = _Client()
@@ -109,6 +114,47 @@ class SafetyPolicyTests(unittest.TestCase):
             app._start_return_to_origin()
         self.assertEqual(app.test_steps, 0)
         self.assertIn("實體", app.fault_reason)
+
+    def test_pose_freshness_never_bypassed_while_building(self):
+        app = UR10VisionQtApp.__new__(UR10VisionQtApp)
+        app.POSE_FEEDBACK_TIMEOUT = 0.5
+        client = _Client()
+        app.rtde_client = client
+        client.control_ready = False
+        client.pose_received_at = monotonic() - 10.0
+        self.assertFalse(UR10VisionQtApp._workspace_feedback_is_fresh(app))
+        client.control_ready = True
+        self.assertFalse(UR10VisionQtApp._workspace_feedback_is_fresh(app))
+        client.pose_received_at = monotonic()
+        self.assertTrue(UR10VisionQtApp._workspace_feedback_is_fresh(app))
+
+    def test_zone_command_prefers_clear_vertical_over_depth_drift(self):
+        app = UR10VisionQtApp.__new__(UR10VisionQtApp)
+        app.neutral_x = 0.50
+        app.neutral_y = 0.50
+        app.neutral_hand_size = 0.20
+        app.depth_inverted = False
+        app._value = lambda name: .10 if name == "Dead zone" else 1.0
+
+        # far above neutral with a large palm-size drift: vertical must win
+        self.assertEqual(
+            UR10VisionQtApp._zone_command(app, 0.50, 0.25, 0.30, 0.9, 0.38),
+            (0.0, 0.0, 0.38, "UP"))
+        # far below neutral: DOWN wins too
+        self.assertEqual(
+            UR10VisionQtApp._zone_command(app, 0.50, 0.80, 0.30, 0.9, 0.38),
+            (0.0, 0.0, -0.38, "DOWN"))
+        # moderate offset with size near neutral: UP
+        self.assertEqual(
+            UR10VisionQtApp._zone_command(app, 0.50, 0.35, 0.205, 0.9, 0.38),
+            (0.0, 0.0, 0.38, "UP"))
+        # forward push near neutral: depth still wins
+        self.assertEqual(
+            UR10VisionQtApp._zone_command(app, 0.50, 0.55, 0.30, 0.9, 0.38)[3], "FWD")
+        # inside every dead zone: STOP
+        self.assertEqual(
+            UR10VisionQtApp._zone_command(app, 0.50, 0.52, 0.202, 0.9, 0.38),
+            (0.0, 0.0, 0.0, "STOP"))
 
     def test_dashboard_remote_state_accepts_split_greeting_and_boolean(self):
         class FakeSocket:
