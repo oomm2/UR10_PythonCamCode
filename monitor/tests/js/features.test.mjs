@@ -14,6 +14,7 @@ import { createReplay, DEFAULT_SPEEDS } from '../../static/replay.js';
 import {
   isTheme, nextTheme, applyTheme, readStoredTheme, storeTheme, THEMES,
 } from '../../static/theme.js';
+import { isLanguage, nextLanguage, readStoredLanguage, translateText } from '../../static/language.js';
 
 const point = (x = 0, y = 0, z = 0.5) => [x, y, z, 0, 0, 0, 0, 0, 0];
 
@@ -37,6 +38,16 @@ function fakeDoc() {
     _attributes: attributes,
   };
 }
+
+test('monitor language switches between English and Cantonese without changing telemetry values', () => {
+  const storage = fakeStorage({ 'ur-monitor-language': 'yue' });
+  assert.equal(readStoredLanguage(storage), 'yue');
+  assert.equal(nextLanguage('yue'), 'en');
+  assert.equal(isLanguage('fr'), false);
+  assert.equal(translateText('Robot Status', 'yue'), '機械人狀態');
+  assert.equal(translateText('Robot Status', 'en'), 'Robot Status');
+  assert.equal(translateText('Robot IP 192.0.2.10', 'yue'), '機械人 IP 192.0.2.10');
+});
 
 // --- Trajectory ----------------------------------------------------------
 

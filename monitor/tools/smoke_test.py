@@ -249,7 +249,7 @@ def main() -> int:
             # --- static + CORS ----------------------------------------------
             status, headers, _ = request("GET", "/app.js")
             assert status == 200 and "text/javascript" in headers.get("Content-Type", "")
-            for asset in ("/theme.js", "/scene.js", "/replay.js"):
+            for asset in ("/theme.js", "/language.js", "/scene.js", "/replay.js"):
                 status, _, _ = request("GET", asset)
                 assert status == 200, (asset, status)
             status, _, body = request("GET", "/ur10.urdf")

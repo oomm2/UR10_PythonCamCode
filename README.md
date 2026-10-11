@@ -61,7 +61,7 @@ python ur10_vision_qt_app.py
 2. Hold an open palm steady and click **校準姿態** below the preview.
 3. Observe the on-screen direction state while robot control stays disabled.
 
-Use the top-right **深色模式 / 淺色模式** button to change the theme; the choice is saved locally. The software STOP button remains visible at the bottom of every tab. See [offline validation](docs/validation.md) and the [dark UI preview](docs/ui-preview-dark.png).
+Use the top-right **English / 廣東話** button to switch the controller language and **深色模式 / 淺色模式** to change the theme. Both choices are saved in local `settings.json`. The monitor has its own English/Cantonese button in the browser and remembers that choice locally. The software STOP button remains visible at the bottom of every tab. See [offline validation](docs/validation.md) and the [dark UI preview](docs/ui-preview-dark.png).
 
 On macOS, `ur-rtde` may require Boost:
 

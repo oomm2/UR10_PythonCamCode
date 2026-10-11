@@ -3,11 +3,22 @@ import csv
 import os
 import time
 from typing import Optional
+from .i18n import localize
 
 class LoggingMixin:
     def log(self, message: str) -> None:
-        self.event_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {message}")
+        if not hasattr(self, '_log_entries'):
+            self._log_entries = []
+        entry = (time.strftime('%H:%M:%S'), message)
+        self._log_entries.append(entry)
+        self._log_entries = self._log_entries[-200:]
+        self.event_log.appendPlainText(f"[{entry[0]}] {localize(message)}")
         self._csv_row("event", note=message)
+
+    def _render_event_log(self) -> None:
+        self.event_log.clear()
+        for timestamp, message in getattr(self, '_log_entries', ()):
+            self.event_log.appendPlainText(f"[{timestamp}] {localize(message)}")
 
 
     def _setup_csv_logging(self) -> None:
@@ -55,7 +66,7 @@ class LoggingMixin:
             ])
         except (OSError, ValueError) as exc:
             self.csv_writer = None
-            self.event_log.appendPlainText(f"CSV 寫入失敗：{exc}")
+            self.log(f"CSV 寫入失敗：{exc}")
 
 
     def _flush_csv(self) -> None:
@@ -65,4 +76,4 @@ class LoggingMixin:
                 os.fsync(self.csv_file.fileno())
             except (OSError, ValueError) as exc:
                 self.csv_writer = None
-                self.event_log.appendPlainText(f"CSV 儲存失敗：{exc}")
+                self.log(f"CSV 儲存失敗：{exc}")

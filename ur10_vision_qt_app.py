@@ -22,7 +22,7 @@ from safety_config import DEFAULT_SPEED, MAX_TRANSLATIONAL_SPEED, REAL_TARGET, R
 import cv2
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 from types import SimpleNamespace
 from vision_control.motion import MotionMixin
@@ -33,6 +33,7 @@ from vision_control.transport import RTDEWorkerClient
 from vision_control.vision import VisionClient, CameraScanner, MANUAL_CAMERA
 from vision_control.gestures import zone_command
 from vision_control.policy import Mode, fresh, FRAME_TIMEOUT, RETURN_TIMEOUT
+from vision_control.i18n import LocalizedMessageBox as QMessageBox
 
 cv2.setNumThreads(1)
 
@@ -81,6 +82,8 @@ class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin
         self.resize(1440, 900)
         self.setMinimumSize(1000, 720)
         self.theme = 'light'
+        self.language = 'yue'
+        QApplication.instance().setProperty('ui_language', self.language)
 
         self.vision = None
         self.scanner = None
@@ -180,7 +183,7 @@ class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin
     def _update_status(self, command: str = "STOP", hand: str = "-, -",
                        confidence: float = 0.0) -> None:
         connected = bool(self.rtde_client and self.rtde_client.connected)
-        robot = f"{self.target_combo.currentText()} | " + ("已連接" if connected else "未連接")
+        robot = f"{self._target_id()} | " + ("已連接" if connected else "未連接")
         self.status_values["Robot"].setText(robot)
         self.status_values["Control"].setText({Mode.DISABLED:"關閉", Mode.READY:"待命", Mode.GESTURE:"手勢", Mode.AXIS_TEST:"單軸測試", Mode.RETURN:"返回原點", Mode.FAULT:"故障鎖定"}[self.mode])
         dispatched = getattr(self.rtde_client, 'dispatched_velocity', None)
@@ -249,13 +252,26 @@ class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin
         self._repolish(self.workspace_status)
         self._refresh_workflow()
 
+    def _target_id(self) -> str:
+        data = self.target_combo.currentData() if hasattr(self.target_combo, 'currentData') else None
+        return data if data in (URSIM_TARGET, REAL_TARGET) else self.target_combo.currentText()
+
+    def _set_target_id(self, target: str) -> None:
+        self.target_combo.blockSignals(True)
+        try:
+            index = self.target_combo.findData(target) if hasattr(self.target_combo, 'findData') else -1
+            if index >= 0:
+                self.target_combo.setCurrentIndex(index)
+            else:
+                self.target_combo.setCurrentText(target)
+        finally:
+            self.target_combo.blockSignals(False)
+
     def _target_changed(self, target: str) -> None:
         if self.connection_in_progress or self.rtde_client is not None:
             # The target is locked for the whole connection session. Safety
             # decisions use session_identity, never a relabelled combo box.
-            self.target_combo.blockSignals(True)
-            self.target_combo.setCurrentText(self.session_identity[0] if self.session_identity else target)
-            self.target_combo.blockSignals(False)
+            self._set_target_id(self.session_identity[0] if self.session_identity else target)
             return
         if hasattr(self, "_ips"):
             previous = getattr(self, "_last_target", target)
@@ -286,14 +302,14 @@ class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin
 
 
     def confirm_physical_speed(self):
-        if self.target_combo.currentText() == REAL_TARGET and not self.robot_enabled:
+        if self._target_id() == REAL_TARGET and not self.robot_enabled:
             self.real_speed_selected = True
             self.selected_real_speed = self._value('Max speed')
             self.log(f'已明確選擇實體速度 {self.selected_real_speed:.2f} m/s')
 
     def _max_speed_changed(self, _value: int) -> None:
         if (getattr(self, "target_combo", None) is not None
-                and self.target_combo.currentText() == REAL_TARGET
+                and self._target_id() == REAL_TARGET
                 and not self.robot_enabled
                 and not self.connection_in_progress
                 and not self._setting_speed_profile):
@@ -316,7 +332,7 @@ class UR10VisionQtApp(MotionMixin, DashboardUiMixin, SettingsMixin, LoggingMixin
         if self.rtde_client is not None:
             self._disconnect_robot()
             return
-        target = self.target_combo.currentText()
+        target = self._target_id()
         host = self.robot_ip.text().strip()
         self.connection_in_progress = True
         self.target_combo.setEnabled(False)

@@ -94,6 +94,39 @@ class UiTests(unittest.TestCase):
         w._save_settings()
         with open(w.SETTINGS_PATH) as fh:self.assertEqual(json.load(fh)['camera_source'],'manual')
 
+    def test_language_switch_translates_ui_and_keeps_target_identity(self):
+        w=self.window
+        w.robot=w.rtde_client=None
+        w.session_identity=None
+        w.toggle_language()
+        self.assertEqual(w.language,'en')
+        self.assertEqual(w.side_tabs.tabText(0),'Operate')
+        self.assertEqual(w.target_combo.itemText(1),'Physical UR10')
+        self.assertEqual(w.enable_button.text(),'Enable robot control')
+        self.assertIn('Ready. Connect URSim',w.event_log.toPlainText())
+        w.target_combo.setCurrentIndex(1)
+        self.assertEqual(w._target_id(),REAL_TARGET)
+        with open(w.SETTINGS_PATH) as fh:
+            saved=json.load(fh)
+        self.assertEqual(saved['target'],REAL_TARGET)
+        self.assertEqual(saved['language'],'en')
+        with patch.object(QMessageBox,'warning') as warning:
+            w.toggle_robot_control()
+        self.assertEqual(warning.call_args.args[1],'Robot disconnected')
+        w.toggle_language()
+        self.assertEqual(w.target_combo.itemText(1),REAL_TARGET)
+        self.assertIn('就緒。請先連接 URSim',w.event_log.toPlainText())
+
+    def test_saved_language_restores_without_changing_control_state(self):
+        w=self.window
+        w.toggle_language()
+        w.language='yue'
+        self.qt.setProperty('ui_language','yue')
+        w._load_settings()
+        self.assertEqual(w.language,'en')
+        self.assertEqual(w.side_tabs.tabText(2),'Settings')
+        self.assertFalse(w.robot_enabled)
+
     def test_settings_load_is_read_only_and_rejects_malformed_values(self):
         w=self.window
         content='{"target":"實體 UR10","max_speed":0.5,"detection":"bad","tracking":"NaN"}'

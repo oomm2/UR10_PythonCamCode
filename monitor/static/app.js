@@ -8,6 +8,7 @@ import {
 } from './telemetry.js';
 import { createReplay } from './replay.js';
 import { createThemeController } from './theme.js';
+import { createLanguageController } from './language.js';
 
 const $ = (selector) => document.querySelector(selector);
 const jointRoot = $('#joints');
@@ -50,6 +51,7 @@ const speedHistory = createHistory();
 const currentHistory = createHistory();
 
 const themeController = createThemeController();
+const languageController = createLanguageController();
 
 function log(text, className = '') {
   const entry = document.createElement('div');
@@ -679,6 +681,7 @@ $('#theme-toggle').addEventListener('click', () => {
   applyTheme(themeController.toggle());
   log(`Theme: ${themeController.theme}`);
 });
+$('#language-toggle').addEventListener('click', () => languageController.toggle());
 $('#help-toggle').addEventListener('click', () => { $('#shortcut-card').hidden = !$('#shortcut-card').hidden; });
 $('#snapshot-button').addEventListener('click', exportSnapshot);
 trailToggle.addEventListener('click', toggleTrail);

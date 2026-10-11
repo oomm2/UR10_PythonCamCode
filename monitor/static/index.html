@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-Hant">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -112,6 +112,7 @@
       <div id="transport" class="pill waiting"><span>Starting…</span></div>
       <div id="frozen" class="pill waiting" hidden><span>Frozen</span></div>
       <div id="connection" class="pill waiting"><span class="dot"></span><span>Disconnected</span></div>
+      <button id="language-toggle" type="button" title="Switch English / Cantonese">廣東話</button>
       <button id="theme-toggle" type="button" title="Toggle light/dark theme (T)">Theme</button>
       <button id="help-toggle" type="button" title="Keyboard shortcuts (?)">?</button>
     </div>
@@ -200,7 +201,7 @@
           <div class="metric"><div class="label">Inference time</div><div id="vision-inference" class="value small-value">—</div></div>
           <div class="metric"><div class="label">Heartbeats received</div><div id="control-count" class="value">—</div></div>
         </div>
-        <div class="controller-note">控制端每秒向 monitor 發 heartbeat 時，IP 會由 Windows 自動從 HTTP source address 記錄。RTDE 本身唔會提供其他 client 的 IP 清單。</div>
+        <div class="controller-note">The controller can send a heartbeat each second. Windows records its HTTP source IP; RTDE does not list other client IPs.</div>
       </section>
       <section class="card">
         <div class="card-title">TCP Pose</div>

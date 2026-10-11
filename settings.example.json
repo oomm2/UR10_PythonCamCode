@@ -5,6 +5,7 @@
   "direction_inverted": false,
   "depth_inverted": false,
   "theme": "light",
+  "language": "yue",
   "camera_source": "0",
   "camera_manual": "0",
   "max_speed": 0.02,

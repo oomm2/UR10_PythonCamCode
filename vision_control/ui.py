@@ -5,8 +5,11 @@ from pathlib import Path
 from .vision import MANUAL_CAMERA
 from .clock import monotonic
 from .policy import Mode, fresh, FRAME_TIMEOUT
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QTabWidget,
-    QScrollArea, QPlainTextEdit, QComboBox, QLineEdit, QPushButton, QGridLayout, QSizePolicy, QSlider, QProgressBar)
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QScrollArea, QPlainTextEdit, QGridLayout, QSizePolicy, QSlider, QProgressBar)
+from .i18n import (LocalizedLabel as QLabel, LocalizedFrame as QFrame,
+    LocalizedTabWidget as QTabWidget, LocalizedComboBox as QComboBox,
+    LocalizedLineEdit as QLineEdit, LocalizedButton as QPushButton)
 
 class DashboardUiMixin:
     def _build_ui(self) -> None:
@@ -28,6 +31,10 @@ class DashboardUiMixin:
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
+        self.language_button = QPushButton("English")
+        self.language_button.setObjectName("languageButton")
+        self.language_button.clicked.connect(self.toggle_language)
+        header.addWidget(self.language_button)
         self.theme_button = QPushButton("深色模式")
         self.theme_button.setObjectName("themeButton")
         self.theme_button.setToolTip("切換深色／淺色介面")
@@ -234,7 +241,7 @@ class DashboardUiMixin:
         if self.enable_button.property('active') != self.robot_enabled:
             self.enable_button.setProperty('active', self.robot_enabled)
             self._repolish(self.enable_button)
-        self.confirm_speed_button.setVisible(self.target_combo.currentText() == "實體 UR10")
+        self.confirm_speed_button.setVisible(self._target_id() == "實體 UR10")
 
     def _build_log_card(self) -> QWidget:
         card = QWidget()
@@ -306,8 +313,9 @@ class DashboardUiMixin:
         layout.addWidget(self._section_label("機械人連線"))
 
         self.target_combo = QComboBox()
-        self.target_combo.addItems(["URSim", "實體 UR10"])
-        self.target_combo.currentTextChanged.connect(self._target_changed)
+        self.target_combo.addItem("URSim", "URSim")
+        self.target_combo.addItem("實體 UR10", "實體 UR10")
+        self.target_combo.currentIndexChanged.connect(lambda _index: self._target_changed(self._target_id()))
         fields = QHBoxLayout()
         fields.setSpacing(8)
         fields.addWidget(self.target_combo, 1)
@@ -637,4 +645,20 @@ class DashboardUiMixin:
         self.theme = 'light' if self.theme == 'dark' else 'dark'
         self.theme_button.setText('淺色模式' if self.theme == 'dark' else '深色模式')
         self._apply_style()
+        self._save_settings()
+
+    def _retranslate_ui(self) -> None:
+        QApplication.instance().setProperty('ui_language', self.language)
+        for widget in self.findChildren(QWidget):
+            retranslate = getattr(widget, 'retranslate', None)
+            if retranslate is not None:
+                retranslate()
+        self.language_button.setText('廣東話' if self.language == 'en' else 'English')
+        if hasattr(self, '_render_event_log'):
+            self._render_event_log()
+        self._update_status()
+
+    def toggle_language(self) -> None:
+        self.language = 'en' if self.language == 'yue' else 'yue'
+        self._retranslate_ui()
         self._save_settings()

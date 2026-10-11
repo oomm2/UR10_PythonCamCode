@@ -3,14 +3,16 @@ from .clock import monotonic
 import math
 import time
 from typing import Optional
-from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QMessageBox
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout
+from .i18n import (LocalizedCheckBox as QCheckBox, LocalizedLabel as QLabel,
+    LocalizedMessageBox as QMessageBox, localize)
 from safety_config import URSIM_TARGET, REAL_TARGET, cap_translational_velocity, workspace_is_configured, workspace_errors
 from .policy import Mode, fresh, guarded_velocity, pose_inside
 
 class MotionMixin:
     def _confirm_real_robot_checklist(self, is_cb3: bool) -> bool:
         dialog = QDialog(self)
-        dialog.setWindowTitle("實體 UR10 安全檢查清單")
+        dialog.setWindowTitle(localize("實體 UR10 安全檢查清單"))
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(
             "啟動實體機械人移動前，請逐項確認以下安全事項："))
@@ -23,8 +25,8 @@ class MotionMixin:
             checkboxes.append(checkbox)
             layout.addWidget(checkbox)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("全部確認")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.button(QDialogButtonBox.Ok).setText(localize("全部確認"))
+        buttons.button(QDialogButtonBox.Cancel).setText(localize("取消"))
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -48,7 +50,7 @@ class MotionMixin:
             )
             if answer != QMessageBox.Yes:
                 return
-            if self.session_identity is None or self.session_identity[0] != self.target_combo.currentText():
+            if self.session_identity is None or self.session_identity[0] != self._target_id():
                 QMessageBox.warning(self, "連線目標已變更", "連線期間禁止變更控制目標。")
                 return
             if not self.rtde_client.control_ready:

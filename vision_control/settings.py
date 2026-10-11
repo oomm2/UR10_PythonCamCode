@@ -9,12 +9,13 @@ from .vision import MANUAL_CAMERA
 class SettingsMixin:
     def _settings_data(self):
         return {
-            'target': self.target_combo.currentText(),
+            'target': self._target_id(),
             'robot_ip_ursim': self._ips.get(URSIM_TARGET, '127.0.0.1'),
             'robot_ip_real': self._ips.get(REAL_TARGET, ''),
             'direction_inverted': self.direction_inverted,
             'depth_inverted': self.depth_inverted,
             'theme': self.theme,
+            'language': self.language,
             'camera_source': self.camera_combo.currentData(),
             'camera_manual': self.camera_source.text(),
             **{key:self._value(name) for key,name in (
@@ -38,6 +39,8 @@ class SettingsMixin:
         try:
             theme = data.get('theme', 'light')
             self.theme = theme if theme in ('light', 'dark') else 'light'
+            language = data.get('language', 'yue')
+            self.language = language if language in ('yue', 'en') else 'yue'
             self.theme_button.setText('淺色模式' if self.theme == 'dark' else '深色模式')
             self._apply_style()
             for target, key in ((URSIM_TARGET,'robot_ip_ursim'),(REAL_TARGET,'robot_ip_real')):
@@ -47,9 +50,7 @@ class SettingsMixin:
             target = data.get('target', URSIM_TARGET)
             if target not in (URSIM_TARGET, REAL_TARGET):
                 target = URSIM_TARGET
-            self.target_combo.blockSignals(True)
-            self.target_combo.setCurrentText(target)
-            self.target_combo.blockSignals(False)
+            self._set_target_id(target)
             self._last_target = target
             self._apply_target_profile(target, data.get('max_speed'))
             self.robot_ip.setText(self._ips[target])
@@ -84,12 +85,13 @@ class SettingsMixin:
                     continue
         finally:
             self._loading_settings = False
+        self._retranslate_ui()
         self.log('本機設定已載入')
 
     def _save_settings(self):
         if not hasattr(self,'_ips') or self._loading_settings:
             return
-        self._ips[self.target_combo.currentText()] = self.robot_ip.text().strip()
+        self._ips[self._target_id()] = self.robot_ip.text().strip()
         temporary = None
         try:
             with tempfile.NamedTemporaryFile('w', dir=os.path.dirname(self.SETTINGS_PATH),

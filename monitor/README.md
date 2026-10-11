@@ -115,6 +115,7 @@ The Digital Twin uses the official Universal Robots UR10 visual DAE meshes and a
 - **Latency.** The Link Diagnostics card shows send-to-receive latency once the Mac controller heartbeats include a `sent_at` field. See _Latency_ below.
 - **Baseline comparison.** A finished recording can be loaded as a baseline; the chart then draws the baseline and live curves on a shared time axis.
 - **Theme.** The toggle switches between the dark and light palettes and remembers the choice in `localStorage`.
+- **Language.** The header button switches the dashboard between English and Cantonese and remembers the choice in `localStorage`. It changes display text only; telemetry and recordings remain unchanged.
 - **Snapshot / report.** `C` exports the current view. See _Screenshot and report_ below.
 - **Help.** `?` opens the keyboard-shortcut card; every shortcut is listed there.
 
@@ -223,6 +224,7 @@ The CSV header is fixed and documented in `recording.py` as `RECORDING_COLUMNS`.
 - `static/telemetry.js` — testable polling, SSE client, state validation, history, chart and trajectory helpers
 - `static/replay.js` — timeline scrubber used by the trajectory replay
 - `static/theme.js` — theme controller shared by the dashboard
+- `static/language.js` — English/Cantonese display translation and saved preference
 - `static/vendor/` — pinned local Three.js and URDF loader modules with licenses
 - `static/ur10.urdf` — flattened UR10 kinematic hierarchy used by the browser
 - `static/joint_limits.json` — nominal bar ranges for the six joints

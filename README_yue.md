@@ -59,7 +59,7 @@ python ur10_vision_qt_app.py
 2. 張開手掌、保持唔郁，撳預覽下方嘅 **校準姿態**。
 3. 睇畫面上嘅方向狀態，同時保持 robot control 關閉。
 
-右上角 **深色模式／淺色模式** 可以即時切換，選擇會儲存喺本機。每個分頁底部都睇到軟件 STOP。詳見 [離線驗證](docs/validation.md) 同 [深色介面預覽](docs/ui-preview-dark.png)。
+右上角 **English／廣東話** 可以切換控制介面語言，**深色模式／淺色模式** 可以切換主題；兩個選擇都會儲存喺本機 `settings.json`。監控網頁亦有獨立嘅英文／廣東話按鈕，會喺瀏覽器記住選擇。每個分頁底部都睇到軟件 STOP。詳見 [離線驗證](docs/validation.md) 同 [深色介面預覽](docs/ui-preview-dark.png)。
 
 macOS 安裝 `ur-rtde` 時可能需要 Boost：
 
